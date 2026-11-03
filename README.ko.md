@@ -118,7 +118,7 @@ iPhone 15 Pro, iOS 18.6.2, Xcode 27.2, pymobiledevice3 11.49.2에서 시험했�
 
 ```bash
 /plugin marketplace add GUMBOKIM/iphone-webkit-inspector
-/plugin install iphone-webkit-inspector@iphone-webkit-inspector
+/plugin install iphone-webkit-inspector@gumbokim
 ```
 
 설치한 뒤 Claude에게 "이 페이지 아이폰에서 확인해 줘"처럼 말하거나 `/iphone-webkit-inspector:iphone-webkit-inspector`를 실행하면 됩니다. 설정이 맞는지 보려면 Claude에게 `doctor`를 돌려 달라고 하세요.

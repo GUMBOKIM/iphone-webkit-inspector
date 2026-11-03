@@ -1,6 +1,6 @@
 {
-  "name": "iphone-webkit-inspector",
-  "description": "Claude Code plugin for inspecting and driving Safari or Chrome on a real iPhone through Web Inspector.",
+  "name": "gumbokim",
+  "description": "Claude Code plugins by GUMBOKIM.",
   "owner": {
     "name": "GUMBOKIM",
     "url": "https://github.com/GUMBOKIM"

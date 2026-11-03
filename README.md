@@ -122,7 +122,7 @@ Tested on an iPhone 15 Pro with iOS 18.6.2, Xcode 27.2, pymobiledevice3 11.49.2.
 
 ```bash
 /plugin marketplace add GUMBOKIM/iphone-webkit-inspector
-/plugin install iphone-webkit-inspector@iphone-webkit-inspector
+/plugin install iphone-webkit-inspector@gumbokim
 ```
 
 Then ask Claude something like "check this page on my iPhone", or run `/iphone-webkit-inspector:iphone-webkit-inspector`.
