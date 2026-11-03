@@ -3,3 +3,6 @@ contact_links:
   - name: Check the README first
     url: https://github.com/GUMBOKIM/iphone-webkit-inspector#readme
     about: Setup steps, what's supported, and known limits.
+  - name: Report a security problem privately
+    url: https://github.com/GUMBOKIM/iphone-webkit-inspector/security/advisories/new
+    about: Please don't file security issues publicly.

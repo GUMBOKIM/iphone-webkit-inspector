@@ -8,6 +8,7 @@
 // Usage: node ios.mjs <command> [args]   (run with no args for the list)
 
 import { spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { mkdirSync, openSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { homedir, hostname, tmpdir } from 'node:os';
@@ -19,6 +20,7 @@ const DAEMON_PORT = Number(process.env.IOS_DAEMON_PORT || 9334);
 const STATE_DIR = join(homedir(), '.cache', 'iphone-webkit-inspector');
 const LOG_FILE = join(STATE_DIR, 'daemon.log');
 const PID_FILE = join(STATE_DIR, 'daemon.pid');
+const TOKEN_FILE = join(STATE_DIR, 'token');
 const MAX_EVENTS = 3000;
 // Exact version the bridge was tested with; override with IOS_PMD3_VERSION.
 const PMD3 = `pymobiledevice3==${process.env.IOS_PMD3_VERSION || '11.49.2'}`;
@@ -358,7 +360,9 @@ async function runDaemon() {
 	});
 	const transport = process.env.IOS_TRANSPORT || (listed ? 'usb' : 'wifi');
 	log('transport', transport);
-	const bridge = spawn('uvx', pmd3('webinspector', 'cdp', '--port', String(BRIDGE_PORT), ...(transport === 'wifi' ? ['--native'] : [])), { stdio: ['ignore', 'inherit', 'inherit'] });
+	// bridge_guard.py starts the same bridge but refuses browser (Origin) and non-local Host requests.
+	const guard = fileURLToPath(new URL('./bridge_guard.py', import.meta.url));
+	const bridge = spawn('uvx', ['--python', '3.12', '--from', PMD3, 'python', guard, 'webinspector', 'cdp', '--port', String(BRIDGE_PORT), ...(transport === 'wifi' ? ['--native'] : [])], { stdio: ['ignore', 'inherit', 'inherit'] });
 	bridge.on('exit', (code) => {
 		log('bridge exited', code);
 		process.exit(1);
@@ -366,6 +370,7 @@ async function runDaemon() {
 	const shutdown = () => {
 		bridge.kill();
 		rmSync(PID_FILE, { force: true });
+		rmSync(TOKEN_FILE, { force: true });
 		process.exit(0);
 	};
 	process.on('SIGTERM', shutdown);
@@ -821,7 +826,7 @@ async function runDaemon() {
 		},
 
 		// ---- Application
-		async cookies({ clear }) {
+		async cookies({ clear, values }) {
 			const tab = await currentTab();
 			const r = await tab.send('Page.getCookies');
 			if (r.error) throw new Error(r.error.message);
@@ -830,7 +835,7 @@ async function runDaemon() {
 				for (const c of list.filter((c) => clear === true || c.name === clear)) await tab.send('Page.deleteCookie', { cookieName: c.name, url: tab.url });
 				return { deleted: list.filter((c) => clear === true || c.name === clear).map((c) => c.name) };
 			}
-			return list.map((c) => ({ name: c.name, value: c.value.length > 60 ? c.value.slice(0, 60) + '…' : c.value, domain: c.domain, path: c.path, expires: c.session ? 'session' : new Date(c.expires).toISOString().slice(0, 10), httpOnly: c.httpOnly, secure: c.secure, sameSite: c.sameSite }));
+			return list.map((c) => ({ name: c.name, value: values ? (c.value.length > 60 ? c.value.slice(0, 60) + '…' : c.value) : `<${c.value.length} chars, --values to show>`, domain: c.domain, path: c.path, expires: c.session ? 'session' : new Date(c.expires).toISOString().slice(0, 10), httpOnly: c.httpOnly, secure: c.secure, sameSite: c.sameSite }));
 		},
 		async storage({ kind = 'local', clear }) {
 			const tab = await currentTab();
@@ -998,7 +1003,19 @@ async function runDaemon() {
 		},
 	};
 
+	// Only ios.mjs may talk to the daemon: it must present the token from TOKEN_FILE (readable by
+	// this user only). Browser requests are refused outright (they carry Origin; a page can't set
+	// the token header without a CORS preflight, which is never answered), and so are Hosts other
+	// than 127.0.0.1 (DNS rebinding).
+	const token = randomBytes(24).toString('hex');
+	writeFileSync(TOKEN_FILE, token, { mode: 0o600 });
 	createServer(async (req, res) => {
+		const host = String(req.headers.host || '').replace(/:\d+$/, '');
+		if (req.headers.origin || req.headers['x-iwi-token'] !== token || !['127.0.0.1', 'localhost'].includes(host) || req.method !== 'POST') {
+			res.writeHead(403).end();
+			req.resume();
+			return;
+		}
 		let body = '';
 		for await (const c of req) body += c;
 		const cmd = req.url.slice(1);
@@ -1023,7 +1040,12 @@ async function runDaemon() {
 // ---------------------------------------------------------------- client
 
 async function call(cmd, args = {}) {
-	const r = await fetch(`http://127.0.0.1:${DAEMON_PORT}/${cmd}`, { method: 'POST', body: JSON.stringify(args) });
+	let token = '';
+	try {
+		token = readFileSync(TOKEN_FILE, 'utf8').trim();
+	} catch {}
+	const r = await fetch(`http://127.0.0.1:${DAEMON_PORT}/${cmd}`, { method: 'POST', headers: { 'x-iwi-token': token, 'content-type': 'application/json' }, body: JSON.stringify(args) });
+	if (r.status === 403) throw new Error('daemon refused the request (stale token?) — run `ios.mjs stop` and retry');
 	const d = await r.json();
 	if (!d.ok) throw new Error(d.error);
 	return d.result;
@@ -1040,6 +1062,9 @@ async function daemonUp() {
 
 async function ensureDaemon() {
 	if (await daemonUp()) return;
+	// Something answers on the daemon port but refuses us: a daemon from another install or a stale token.
+	const probe = await fetch(`http://127.0.0.1:${DAEMON_PORT}/status`, { method: 'POST' }).catch(() => null);
+	if (probe) throw new Error(`port ${DAEMON_PORT} is in use by a daemon that refuses this client; stop it (pkill -f "ios.mjs __daemon") and retry`);
 	mkdirSync(STATE_DIR, { recursive: true });
 	const out = openSync(LOG_FILE, 'a');
 	const child = spawn(process.execPath, [fileURLToPath(import.meta.url), '__daemon'], { detached: true, stdio: ['ignore', out, out] });
@@ -1151,7 +1176,7 @@ const PLUGIN_VERSION = (() => {
 
 // Collects versions, the device model, doctor output and the daemon log tail into an issue body.
 // Device and Mac names, UDIDs, home paths and visited URLs are redacted.
-async function report({ title, what, submit }) {
+async function report({ title, what }) {
 	const line = async (cmd, args) => (await run(cmd, args)).out.trim().split('\n')[0];
 	const devices = (await devicectlJson(['list', 'devices']))?.devices || [];
 	const dev = devices.find((d) => d.connectionProperties?.tunnelState === 'connected') || devices[0];
@@ -1186,15 +1211,9 @@ async function report({ title, what, submit }) {
 	const file = join(tmpdir(), `iphone-webkit-inspector-report-${Date.now()}.md`);
 	writeFileSync(file, body);
 	const t = title || 'Bug: ';
-	if (submit) {
-		const r = await run('gh', ['issue', 'create', '--repo', REPO, '--title', t, '--body-file', file, '--label', 'bug']);
-		console.log(r.code === 0 ? `filed: ${r.out.trim().split('\n').pop()}` : `gh failed (${r.out.trim()}); body saved to ${file}`);
-		return;
-	}
 	const short = body.length > 6000 ? body.slice(0, 6000) + '\n…(truncated, full report in the file)' : body;
 	console.log(`report saved: ${file}\n`);
 	console.log(`open to file an issue (review it first):\nhttps://github.com/${REPO}/issues/new?labels=bug&title=${encodeURIComponent(t)}&body=${encodeURIComponent(short)}`);
-	console.log(`\nor file it directly: node ${fileURLToPath(import.meta.url)} report --title "..." --what "..." --submit   (uses gh)`);
 }
 
 async function connectedUdid() {
@@ -1218,7 +1237,7 @@ Element targets (<el>): CSS selector | text=<label> | @e12 (from snapshot) | x y
   start | stop | status        background bridge (auto-starts on first command)
   doctor                       check Xcode, the iPhone, and the Safari/Chrome inspector settings
   launch [safari|chrome|<bundle-id>] [url] [--restart]   open an app (new tab when a url is given)
-  report [--title t] [--what text] [--submit]   collect diagnostics for a GitHub issue
+  report [--title t] [--what text]   collect redacted diagnostics and print a prefilled GitHub issue link
 
  tabs and pages
   tabs                         list tabs (visible = on the iPhone screen)
@@ -1263,7 +1282,7 @@ Element targets (<el>): CSS selector | text=<label> | @e12 (from snapshot) | x y
   frame-eval <js>              evaluate in the paused frame
 
  application
-  cookies [--clear [name]]     cookies for the page
+  cookies [--values] [--clear [name]]   cookies for the page (values hidden unless --values)
   storage [local|session] [--clear]
   idb                          IndexedDB databases and object stores
 
@@ -1298,7 +1317,7 @@ async function main() {
 	};
 
 	if (cmd === 'doctor') return doctor(flags.has('--no-chrome'));
-	if (cmd === 'report') return report({ title: flagVal('--title'), what: flagVal('--what'), submit: flags.has('--submit') });
+	if (cmd === 'report') return report({ title: flagVal('--title'), what: flagVal('--what') });
 
 	if (cmd === 'launch') {
 		// Opens an app on the phone via Xcode's devicectl. --restart is needed after toggling Chrome's Web Inspector.
@@ -1413,7 +1432,7 @@ async function main() {
 			return;
 		}
 		case 'cookies':
-			return console.log(await call('cookies', flags.has('--clear') ? { clear: pos[0] || true } : {}));
+			return console.log(await call('cookies', flags.has('--clear') ? { clear: pos[0] || true } : { values: flags.has('--values') }));
 		case 'storage':
 			return console.log(await call('storage', { kind: pos[0] || 'local', clear: flags.has('--clear') }));
 		case 'idb':

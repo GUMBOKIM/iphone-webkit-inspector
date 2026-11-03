@@ -2,17 +2,16 @@
 
 [한국어](README.ko.md)
 
-A Claude Code plugin that gives Claude DevTools-level access to **Safari or Chrome on a real iPhone**, over USB or Wi-Fi.
+A Claude Code plugin that lets Claude use Safari or Chrome on a real iPhone the way you'd use DevTools, over USB or Wi-Fi.
 
-Playwright and Chrome DevTools can't drive Safari on a physical iPhone. This plugin goes through Safari's Web
-Inspector instead: a small daemon runs the [pymobiledevice3](https://github.com/doronz88/pymobiledevice3) CDP bridge,
-keeps a connection to each tab, and buffers console, network and debugger events. Claude talks to it through one CLI.
+Playwright and Chrome DevTools can't drive Safari on a physical iPhone, so this goes through Safari's Web Inspector.
+A small daemon runs the [pymobiledevice3](https://github.com/doronz88/pymobiledevice3) CDP bridge, holds a connection
+to each tab, and buffers console, network and debugger events. Claude talks to it through one CLI.
 
 ## How it compares
 
-- **Chrome DevTools**: Chrome on your desktop.
-- **Playwright**: its WebKit build on macOS, the closest it gets to Safari. It can't attach to a real iPhone.
-- **This plugin**: Safari or Chrome running on your iPhone.
+Chrome DevTools works on Chrome on your desktop. Playwright's closest thing to Safari is its WebKit build on macOS,
+and it can't attach to a real iPhone. This plugin works on Safari or Chrome running on your iPhone.
 
 ✅ supported · ⚠️ partial · ❌ not supported
 
@@ -76,8 +75,8 @@ keeps a connection to each tab, and buffers console, network and debugger events
 | **Testing** | | | |
 | Test runner and assertions | ❌ | ✅ | ❌ |
 
-In short: almost everything you'd open DevTools for works on the real phone. What's missing is OS-level input
-(native UI, the keyboard), throttling, Lighthouse and LCP.
+In short, most of what you'd open DevTools for works on the real phone. You don't get OS-level input (native UI,
+the keyboard), throttling, Lighthouse or LCP.
 
 ## Commands
 
@@ -99,21 +98,21 @@ Traces, CPU profiles, heap snapshots and HAR files open in Chrome DevTools. Run 
 
 ## Requirements
 
-- macOS with **Xcode** (for `devicectl`). Select it and accept the license once:
+- macOS with Xcode, which provides `devicectl`. Select it and accept the license once:
   ```bash
   sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
   sudo xcodebuild -license accept && sudo xcodebuild -runFirstLaunch
   ```
-- [**uv**](https://docs.astral.sh/uv/) (`brew install uv`). pymobiledevice3 runs through `uvx`; nothing is installed globally.
-- **Node.js 22+** (built-in WebSocket and fetch; no npm dependencies).
-- iPhone on iOS 17 or later, paired with the Mac (connect by USB once and tap Trust), with:
-  - Settings → Privacy & Security → **Developer Mode** on
-  - Settings → Apps → Safari → Advanced → **Web Inspector** on
-  - For Chrome: Chrome → Settings → Content Settings → **Web Inspector** on, then restart Chrome
+- [uv](https://docs.astral.sh/uv/) (`brew install uv`). pymobiledevice3 runs through `uvx`, so nothing gets installed globally.
+- Node.js 22+, for its built-in WebSocket and fetch. There are no npm dependencies.
+- An iPhone on iOS 17 or later, paired with the Mac (connect by USB once and tap Trust), with these turned on:
+  - Settings → Privacy & Security → Developer Mode
+  - Settings → Apps → Safari → Advanced → Web Inspector
+  - For Chrome: Chrome → Settings → Content Settings → Web Inspector, then restart Chrome
 
-**USB or Wi-Fi:** the bridge picks USB when the phone is plugged in. Unplugged, it reuses the Wi-Fi connection
-macOS already keeps to a paired iPhone on the same network (the one Xcode uses), so no Finder setting is needed.
-Force one with `IOS_TRANSPORT=usb|wifi`.
+The bridge uses USB when the phone is plugged in. When it isn't, the bridge reuses the Wi-Fi connection macOS
+already keeps to a paired iPhone on the same network (the one Xcode uses), so you don't need to change anything in
+Finder. To pick one yourself, set `IOS_TRANSPORT=usb|wifi`.
 
 Tested on an iPhone 15 Pro with iOS 18.6.2, Xcode 27.2, pymobiledevice3 11.49.2.
 
@@ -129,27 +128,42 @@ To check your setup, ask Claude to run `doctor`.
 
 ## What it runs and connects to
 
-- `node skills/iphone-webkit-inspector/ios.mjs` — the CLI Claude calls. Readable source, no npm dependencies.
-  The first command starts a background daemon (same script) that listens on `127.0.0.1:9334` only.
-- `uvx --from pymobiledevice3==11.49.2 pymobiledevice3 webinspector cdp --port 9333` — the Web Inspector bridge,
-  listening on `127.0.0.1:9333` only. `uv` downloads that exact version from PyPI the first time.
-- `xcrun devicectl` — lists the iPhone and launches Safari or Chrome on it.
+- `node skills/iphone-webkit-inspector/ios.mjs` is the CLI Claude calls. It's plain readable source with no npm
+  dependencies. The first command starts a background daemon (same script) that listens on `127.0.0.1:9334` only.
+- `uvx --from pymobiledevice3==11.49.2 python bridge_guard.py webinspector cdp --port 9333` is the Web Inspector
+  bridge. It listens on `127.0.0.1:9333` only. The first time, `uv` downloads that exact pymobiledevice3 version from
+  PyPI, and a uv-managed Python 3.12 if you don't have one.
+- `bridge_guard.py` wraps the bridge and refuses requests from web pages (anything with an `Origin` header) and
+  requests with a Host other than `127.0.0.1`/`localhost`, so a site open on your Mac can't reach your phone through
+  it. The daemon also requires a random per-run token stored in `~/.cache/iphone-webkit-inspector/token` (mode 600).
+- `xcrun devicectl` lists the iPhone and launches Safari or Chrome on it.
 - The bridge reaches the iPhone through macOS's `usbmuxd` over USB, or over Wi-Fi through the CoreDevice
-  tunnel macOS already maintains for Xcode (`--native`). Both stay between your Mac and your phone.
-- Pages you open on the phone load from the network as usual. The plugin itself sends nothing anywhere else.
-  `report --submit` files a GitHub issue through your `gh` login, and only when you ask.
-- Files written: `~/.cache/iphone-webkit-inspector/` (daemon pid and log) and the screenshots, traces, profiles,
-  heap snapshots, HAR files and recordings you ask for (default: the system temp folder).
+  tunnel macOS already keeps up for Xcode (`--native`). Either way the traffic stays between your Mac and your phone.
+- Pages you open on the phone load from the network as usual. The plugin itself doesn't send anything anywhere.
+  `report` only prints a link; you decide whether to open it and file the issue.
+- It writes the daemon pid, token and log to `~/.cache/iphone-webkit-inspector/`. Screenshots, traces, profiles, heap
+  snapshots, HAR files and recordings you ask for go to the system temp folder by default.
 - `eval`, `tap`, `type`, `mock`, `block`, `inject`, `ua`, `js` and the debugger change the page on the phone the way
   DevTools would. Claude should only use them on tabs you point it at.
 
+## Privacy
+
+Everything the commands return goes into your Claude Code session, and from there to the model provider like any
+other tool output. That includes what you ask for from the phone: page text and HTML, console messages, request and
+response headers and bodies, localStorage, sessionStorage and IndexedDB contents, and cookie names (cookie values
+only with `cookies --values`). Only point it at tabs you're fine sharing that way, and keep private tabs (mail,
+banking) closed or in the background while you use it.
+
+Nothing is stored except the daemon's state in `~/.cache/iphone-webkit-inspector/` and the files you ask for. The
+daemon keeps recent console and network events in memory until it stops (`ios.mjs stop`, or when the bridge exits).
+
 ## Limits
 
-- Only the tab on the iPhone screen renders, so screenshots, recordings and snapshot boxes need it in front.
-  Background tabs still answer JS, console, network and the debugger.
+- Only the tab that's on the iPhone screen renders, so screenshots, recordings and snapshot boxes need that tab in
+  front. Background tabs still respond to JS, console, network and the debugger.
 - Claude can't switch which tab is on screen, press Safari's own buttons, answer permission prompts, or unlock the phone.
-- `tap` and `type` run inside the page with WebKit's user-gesture emulation; they are not OS-level touches.
-- A performance trace across a navigation to another site comes back nearly empty. Trace a same-site reload instead.
+- `tap` and `type` run inside the page using WebKit's user-gesture emulation. They aren't OS-level touches.
+- If a performance trace spans a navigation to another site, it comes back nearly empty. Trace a same-site reload instead.
 
 ## Reporting a problem
 
@@ -159,10 +173,14 @@ Ask Claude to run `report`, or run it yourself:
 node <plugin>/skills/iphone-webkit-inspector/ios.mjs report --title "..." --what "what you ran, expected, got"
 ```
 
-It collects versions, `doctor` output and the daemon log, redacts device and Mac names, UDIDs, home paths and
-visited URLs, saves the report, and prints a prefilled link to
-[a new issue](https://github.com/GUMBOKIM/iphone-webkit-inspector/issues/new/choose). Add `--submit` to file it with `gh`.
+It gathers versions, `doctor` output and the daemon log, and strips out device and Mac names, UDIDs, home paths and
+visited URLs. Then it saves the report and prints a prefilled link to
+[a new issue](https://github.com/GUMBOKIM/iphone-webkit-inspector/issues/new/choose). Read it before you submit.
+
+Security problems go through [private reporting](SECURITY.md), not public issues.
 
 ## License
+
+Not affiliated with or endorsed by Apple. iPhone, Safari and WebKit are used only to describe what the tool works with.
 
 MIT. pymobiledevice3 is a separate GPL-3.0 project; this plugin runs it through `uvx` and doesn't bundle it.

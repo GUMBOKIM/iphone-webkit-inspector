@@ -9,7 +9,7 @@ body:
         Fastest way: ask Claude to run `report`, or run it yourself:
         `node <plugin>/skills/iphone-webkit-inspector/ios.mjs report --title "..." --what "..."`.
         It collects versions, `doctor` output and the daemon log, with device names, UDIDs and visited URLs redacted.
-        Paste its output below, or use `--submit` to file it with `gh`.
+        Paste its output below. For security problems, use private reporting instead (see SECURITY.md).
   - type: textarea
     id: what
     attributes:

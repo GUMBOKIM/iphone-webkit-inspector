@@ -1,118 +1,106 @@
 ---
 name: iphone-webkit-inspector
-description: Inspect and drive Safari or Chrome on the user's real iPhone (USB or Wi-Fi) with DevTools-level access — open pages, snapshot elements and tap/type by ref, run JS, read console and network (headers, bodies, HAR, WebSockets), block or mock requests, matched CSS rules and box model, accessibility info, layers, cookies/storage/IndexedDB, breakpoints and stepping, screenshots and screen recording, and performance (Performance API timings, Chrome-format traces, JS CPU profiles, CPU/memory usage, heap snapshots). Use whenever something must be checked or debugged on a real iPhone / iOS Safari (iOS-only layout or 100vh bugs, touch, audio/video autoplay, Safari warnings, mobile performance), or when the user says "아이폰에서 확인", "iOS에서 봐줘", "모바일 사파리", "실기기".
+description: Inspect and drive Safari or Chrome on the user's real iPhone (USB or Wi-Fi) with DevTools-level access — open pages, snapshot elements and tap/type by ref, run JS, read console and network (headers, bodies, HAR, WebSockets), block or mock requests, matched CSS rules and box model, accessibility info, layers, cookies/storage/IndexedDB, breakpoints and stepping, screenshots and screen recording, and performance (Performance API timings, Chrome-format traces, JS CPU profiles, CPU/memory usage, heap snapshots). Use whenever something must be checked or debugged on a real iPhone or iOS Safari (iOS-only layout or 100vh bugs, touch, audio/video autoplay, Safari warnings, mobile performance), even if the user only says "on my phone", "아이폰에서 확인", "iOS에서 봐줘", "모바일 사파리", "실기기". Not for desktop Chrome (use Chrome DevTools) or WebKit/device emulation on the Mac (use Playwright).
+argument-hint: "[what to check on the iPhone, e.g. a URL or 'why is this slow']"
 allowed-tools: Bash(node ${CLAUDE_SKILL_DIR}/ios.mjs *)
 ---
 
 # iPhone WebKit Inspector
 
-Playwright can't drive Safari on a real iPhone. This goes through Safari's Web Inspector instead: `ios.mjs` runs a
-background daemon that starts the `pymobiledevice3` CDP bridge (via `uvx`, nothing installed globally), keeps one
-connection per tab, and buffers console, network and debugger events.
+Playwright and Chrome DevTools can't attach to Safari on a real iPhone. This skill goes through Safari's Web
+Inspector instead: `ios.mjs` runs a background daemon that starts the `pymobiledevice3` CDP bridge (via `uvx`),
+keeps one connection per tab, and buffers console, network and debugger events.
 
-Run it as `node ${CLAUDE_SKILL_DIR}/ios.mjs <command>`. Written out in full, that form is pre-approved, so there's
-no permission prompt. `$I` below is shorthand for that path. `help` lists every command.
+## Running commands
 
-**Element targets** (`<el>`): a CSS selector, `text=<label>`, `@e12` from `snapshot`, or `x y` coordinates.
+Every command is `node ${CLAUDE_SKILL_DIR}/ios.mjs <command> [args]`. Always type that full path as the first
+words of the Bash command, one command per call: that exact form is pre-approved while the skill is active, so it runs
+without a permission prompt. A shell variable, `cd`, or a `&&` chain in front breaks the match and the user gets asked every time.
+Below, `ios <command>` is shorthand for the full form.
 
-```bash
-I="${CLAUDE_SKILL_DIR}/ios.mjs"
+Element targets (`<el>`): a CSS selector, `text=<label>`, `@e12` from `snapshot`, or `x y` coordinates.
 
-# setup and pages
-node $I doctor                      # Xcode, iPhone, Developer Mode, Web Inspector (~1 min)
-node $I launch safari|chrome [url]  # bring the browser up; with a url it opens a new tab
-node $I tabs | use <id|url-part>    # list tabs ("visible" = on screen) | pick one
-node $I open <url> | reload | close
-node $I snapshot [--all]            # what's on screen as @eN refs: role, name, state, box
-node $I tap @e7 | tap text=로그인 | type 'input[name=q]' hello
-node $I eval 'document.title'       # statements need `return`; `await` works; --gesture = user gesture
-node $I shot out.png | record start dir/ … record stop
-
-# elements
-node $I dom <el> | styles <el> [--computed color,font-size] | a11y <el>
-node $I highlight <el> | highlight --off | pseudo <el> hover,focus | pseudo <el> off
-node $I listeners <el> | layers
-
-# console and network
-node $I logs [--errors] | net [url-part] [--failed] | req <id> | body <id> [--out f]
-node $I har out.har | ws | events [Method.prefix]
-node $I block <url-part> | mock <url-part> <status> <body|@file> [--type ct] | mocks | unmock
-node $I nocache on|off
-
-# sources and debugger
-node $I scripts [url-part] | source <id|url-part> [--line n] [--out f]
-node $I break <url-part> <line> [--if expr] | break list | break clear
-node $I pause-on uncaught|all|none | pause | paused | step over|into|out | frame-eval <js> | resume
-
-# application
-node $I cookies [--clear [name]] | storage local|session [--clear] | idb
-
-# performance
-node $I perf [--slow]                                   # TTFB, DCL, load, FCP, CLS + resource waterfall
-node $I trace start … reload or interact … trace stop out.json
-node $I profile start … profile stop out.cpuprofile
-node $I usage start … usage stop | heap out.heapsnapshot
-
-# rendering and environment
-node $I media dark|light|print|reset | paintflash on|off | ua <string>|reset | js off|on
-node $I inject '<js>' | inject --clear
-
-node $I cdp <Method> '<json>'       # anything else; unknown methods go to WebKit's own protocol
-node $I report --title "..." --what "..."   # when something breaks (see below)
-```
+The full command list with notes is in `references/commands.md`. Read it when you need a command not shown here or
+the exact flags; `ios help` prints the same list.
 
 ## Before using
 
-- The iPhone is on USB or the same Wi-Fi (picked automatically; `status` shows which), unlocked, browser in front.
-  If `tabs` is empty or nothing is visible, try `launch safari`; if still nothing, run `doctor` and relay its ✗ fix.
-  Don't retry in a loop.
+- The phone is on USB or the same Wi-Fi as the Mac (chosen automatically; `ios status` shows which), unlocked, with
+  the browser in front. If `ios tabs` is empty or nothing is visible, try `ios launch safari`. If that doesn't help,
+  run `ios doctor` and pass its ✗ fix on to the user rather than retrying.
 - The first command starts the bridge (a few seconds). The first call on a tab can take 5–20s; after that ~10ms.
-- To reach a local dev server, run it with `--host` and open `http://<Mac LAN IP>:<port>` (`ipconfig getifaddr en0`).
-- iPhone Chrome works too (UA contains `CriOS`). It needs Chrome → Settings → Content Settings → Web Inspector on,
-  then `launch chrome --restart` once.
-- Some tabs may be the user's private pages (logins, mail). Only work on the tab the user pointed at or one you opened.
+- A local dev server must listen on the LAN (`--host`); open `http://<Mac LAN IP>:<port>` (`ipconfig getifaddr en0`).
+- iPhone Chrome works too (UA contains `CriOS`) once Chrome → Settings → Content Settings → Web Inspector is on and
+  Chrome was restarted (`ios launch chrome --restart`).
+- Other tabs can be the user's private pages (mail, banking, logins). Work only on the tab the user pointed at or a
+  tab you opened yourself.
 
 ## How to work
 
-- Start with `snapshot` to see what's on screen, then act with `tap @eN` / `type @eN`. Refs reset on every snapshot
-  and navigation, so take a new snapshot after the page changes.
-- For layout bugs: `shot`, then `dom` / `styles` / `highlight` on the suspect element.
-- Debugger: a pause freezes the page, so `eval` times out while paused. Use `paused`, `frame-eval`, `step`, and
-  always `resume` (and `pause-on none`, `break clear`) when done. `pause` waits for the next JS that runs.
-- Clean up what changes the page: `unmock`, `nocache off`, `media reset`, `ua reset`, `js on`, `inject --clear`,
-  `paintflash off`, `highlight --off`, and `close` tabs you opened.
+Look before acting. `ios snapshot` lists what's on screen as `@eN` refs with role, name and box; act with
+`ios tap @eN` / `ios type @eN <text>`. Refs reset on every snapshot and navigation, so snapshot again after the
+page changes. `ios shot <path>` and reading the PNG is the fastest way to see what the user sees.
 
-## Tabs
+Pick the tool by question:
 
-- Any open tab can be inspected with `use`, including background ones. JS, console, network and debugger work there;
-  screenshots, recordings, snapshot boxes and viewport sizes need the tab on screen.
-- Bringing a different tab onto the screen isn't possible. Use the visible tab or `launch <url>`.
+| Question | Commands |
+|---|---|
+| What does it look like / why is it laid out that way? | `shot`, `dom <el>`, `styles <el> --computed`, `highlight <el>` |
+| Is something broken? | `logs --errors`, `net --failed`, `req`/`body` |
+| What does the app do on tap? | `listeners <el>`, `tap`, then `logs` / `net` |
+| Why is it slow? | `perf` first; `trace` around a reload for main-thread work; `profile` for hot JS; `usage` for CPU/memory over time |
+| What state is stored? | `cookies` (names only; `--values` when the user wants them), `storage local`, `idb` |
+| Where does this JS go wrong? | `pause-on uncaught`, `break <url-part> <line>`, then `paused`, `step`, `frame-eval`, `resume` |
+| How does it behave if…? | `mock`/`block`, `nocache on`, `media dark`, `ua <string>`, `js off`, `inject` |
 
-## Performance notes
+Ask before anything destructive on the user's own tabs: `cookies --clear` and `storage --clear` can log them out
+or wipe app state.
 
-- `perf` reads the Performance API on the phone. Safari on iOS 18 has no LCP, so it shows `-`.
-- `trace`: start it, then `reload` (same site) or interact, then stop. Navigating to another site during a trace swaps
-  Safari's process and the trace comes back nearly empty. The trace has tasks, layout, paint, composite, rAF, script
-  evaluation and JS samples, but no FCP/DCL marks; take those from `perf`. Opens in Chrome DevTools → Performance.
-- `profile` reports shares of samples, not ms (the bridge's sample timing is unreliable).
-- No network or CPU throttling. For slow networks the user turns on iPhone Settings → Developer → Network Link Conditioner.
+Some commands change the page on the phone. Undo them when done, because the user keeps using that tab:
+`unmock`, `nocache off`, `media reset`, `ua reset`, `js on`, `inject --clear`, `paintflash off`, `highlight --off`,
+`pause-on none`, `break clear`, `resume`, and `close` any tab you opened.
+
+## Examples
+
+**"아이폰에서 이 페이지 레이아웃 깨지는지 봐줘"**
+```
+ios launch safari https://example.com/pricing
+ios shot /tmp/pricing.png            → read the image
+ios snapshot                         → find the element that overflows
+ios dom @e9
+ios styles @e9 --computed width,height,overflow
+```
+Report what's wrong, the CSS rule and file it comes from, and the screenshot path.
+
+**"Why does the blog load slowly on my phone?"**
+```
+ios open https://example.com/
+ios perf --slow                      → TTFB, FCP, slowest resources
+ios trace start
+ios reload
+ios trace stop /tmp/trace.json       → main-thread time, long tasks
+```
+Lead with the numbers, then name the biggest cost and the file that causes it.
 
 ## Limits
 
-- `tap`/`type` run inside the page with WebKit's user-gesture emulation, so audio start, fullscreen and popups are
-  allowed. Native UI (Safari's own buttons, permission prompts, the keyboard, share sheets) can't be touched, and the
-  phone can't be unlocked. Ask the user.
-- `eval` ignores `awaitPromise` in the bridge and polls instead, so keep async work under 30s.
-- If commands hang after the phone slept, `node $I stop` and retry.
+- Only the tab on the phone's screen renders. Background tabs still answer `eval`, `logs`, `net` and the debugger,
+  but screenshots, recordings and snapshot boxes need the tab in front, and switching the visible tab isn't possible.
+- `tap`/`type` are in-page events with WebKit's user-gesture emulation, which is enough for audio, fullscreen and
+  popups. Safari's own UI, permission prompts, the keyboard, share sheets and the lock screen are out of reach; ask
+  the user to do those.
+- While the debugger is paused, the page is frozen and `eval` times out.
+- A trace across a navigation to another site comes back nearly empty; trace a same-site reload.
+- Safari on iOS 18 reports no LCP. There's no network or CPU throttling; for slow networks the user turns on
+  Settings → Developer → Network Link Conditioner.
+- If commands hang after the phone slept, `ios stop` and retry.
 
 ## When something breaks
 
-If a command fails in a way that looks like a bug in this plugin (not a locked phone or a missing setting that
-`doctor` explains), tell the user and offer to report it. With their OK, run
-`node $I report --title "<short summary>" --what "<command, expected, actual>"`. It writes a redacted report
-(no device or Mac names, UDIDs, home paths or visited URLs) and prints a prefilled GitHub issue link for
-`GUMBOKIM/iphone-webkit-inspector`. Show the user the report before anything is filed; add `--submit` only when
-they ask you to file it with `gh`.
+If a command fails in a way that looks like a bug in this plugin (not a locked phone or a setting `doctor`
+explains), say so and offer to report it. With the user's OK, run
+`ios report --title "<summary>" --what "<command, expected, actual>"`. It writes a redacted report and prints a
+prefilled GitHub issue link for `GUMBOKIM/iphone-webkit-inspector`. Give the user the link and the report path;
+they read it and file the issue themselves.
 
-Daemon log: `~/.cache/iphone-webkit-inspector/daemon.log`. Bridge source (what each CDP method maps to):
-`pymobiledevice3/services/web_protocol/cdp_target.py` in the uv cache.
+Daemon log: `~/.cache/iphone-webkit-inspector/daemon.log`.
