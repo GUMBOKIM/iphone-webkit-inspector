@@ -110,7 +110,7 @@ Playwright나 Chrome 개발자 도구로는 실제 아이폰의 Safari를 조종
   - 설정 → 앱 → Safari → 고급 → **웹 속성(Web Inspector)**
   - Chrome을 쓸 때: Chrome → 설정 → 콘텐츠 설정 → **Web Inspector**를 켜고 Chrome을 다시 시작
 
-**USB 또는 Wi-Fi:** 케이블이 꽂혀 있으면 USB로 붙습니다. 케이블이 없으면 같은 네트워크에 있는 페어링된 아이폰과 macOS가 이미 맺어 둔 Wi-Fi 연결(Xcode가 쓰는 그 연결)을 그대로 씁니다. 그래서 Finder에서 따로 설정할 것은 없습니다. `IOS_TRANSPORT=usb|wifi`로 한쪽에 고정할 수도 있습니다.
+**USB 또는 Wi-Fi:** 케이블이 꽂혀 있으면 USB로 붙습니다. 케이블이 없으면 같은 네트워크에 있는 페어링된 아이폰과 macOS가 이미 맺어 둔 Wi-Fi 연결(Xcode가 쓰는 그 연결)을 그대로 씁니다. 그래서 Finder에서 따로 설정할 것은 없습니다. 한쪽에 고정하려면 `ios.mjs stop` 후 `ios.mjs start --usb`(또는 `--wifi`)를 실행하세요.
 
 iPhone 15 Pro, iOS 18.6.2, Xcode 27.2, pymobiledevice3 11.49.2에서 시험했습니다.
 

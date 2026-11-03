@@ -1,4 +1,4 @@
 schema_version: "1.1"
 name: errors-and-rss-failure
 expected_outcome: |
-  Reports console errors and failed requests seen on the iPhone (none, or lists them). Simulates /rss.xml returning 500 on the phone and shows that fetch("/rss.xml") resolves with status 500. Removes the simulated failure afterwards.
+  Reports console errors and failed requests seen on the iPhone (none, or lists them). Simulates /rss.xml returning 500 on the phone and shows that a request to /rss.xml from the page gets status 500. Removes the simulated failure afterwards.

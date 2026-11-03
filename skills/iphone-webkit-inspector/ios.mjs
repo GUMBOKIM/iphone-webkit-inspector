@@ -43,8 +43,8 @@ const originOf = (u) => {
 	}
 };
 const MAX_EVENTS = 3000;
-// Exact version the bridge was tested with; override with IOS_PMD3_VERSION.
-const PMD3 = `pymobiledevice3==${process.env.IOS_PMD3_VERSION || '11.49.2'}`;
+// Exact version the bridge was tested with.
+const PMD3 = 'pymobiledevice3==11.49.2';
 
 const AsyncFunction = (async () => {}).constructor;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -560,7 +560,9 @@ async function runDaemon() {
 		p.on('exit', () => res(/"Identifier"/.test(out)));
 		p.on('error', () => res(false));
 	});
-	const transport = process.env.IOS_TRANSPORT || (listed ? 'usb' : 'wifi');
+	// `start --usb` / `start --wifi` pins the transport; otherwise USB when the phone is listed there.
+	const forced = ['usb', 'wifi'].includes(process.argv[3]) ? process.argv[3] : null;
+	const transport = forced || (listed ? 'usb' : 'wifi');
 	log('transport', transport);
 	// bridge_guard.py starts the same bridge on a Unix socket in the owner-only state dir (no TCP port).
 	const guard = fileURLToPath(new URL('./bridge_guard.py', import.meta.url));
@@ -1373,7 +1375,7 @@ async function daemonUp() {
 	}
 }
 
-async function ensureDaemon() {
+async function ensureDaemon(transport = '') {
 	if (await daemonUp()) return;
 	ensureStateDir();
 	// One starter at a time; a lock older than 2 minutes is from a crashed start and is taken over.
@@ -1394,7 +1396,7 @@ async function ensureDaemon() {
 		try {
 			chmodSync(LOG_FILE, 0o600);
 		} catch {}
-		const child = spawn(process.execPath, [fileURLToPath(import.meta.url), '__daemon'], { detached: true, stdio: ['ignore', out, out] });
+		const child = spawn(process.execPath, [fileURLToPath(import.meta.url), '__daemon', transport], { detached: true, stdio: ['ignore', out, out] });
 		child.unref();
 	}
 	const unlock = () => starter && rmSync(LOCK_FILE, { force: true });
@@ -1497,8 +1499,8 @@ async function doctor(skipChrome) {
 }
 
 const REPO = 'GUMBOKIM/iphone-webkit-inspector';
-// Keep in sync with .claude-plugin/plugin.json.
-const PLUGIN_VERSION = '0.6.0';
+// Keep in sync with the plugin manifest's version.
+const PLUGIN_VERSION = '0.6.1';
 
 // Collects versions, the device model, doctor output and the daemon log tail into an issue body.
 // Device and Mac names, UDIDs, home paths and visited URLs are redacted.
@@ -1573,8 +1575,8 @@ function pmd3Dev(args, { onLine, timeoutMs } = {}) {
 	});
 }
 
-async function connectedUdid() {
-	if (process.env.IOS_UDID) return process.env.IOS_UDID;
+async function connectedUdid(udid) {
+	if (udid) return udid;
 	const out = join(tmpdir(), `devicectl-${process.pid}.json`);
 	await new Promise((r) => spawn('xcrun', ['devicectl', 'list', 'devices', '--json-output', out], { stdio: 'ignore' }).on('exit', r));
 	const list = JSON.parse(readFileSync(out, 'utf8')).result?.devices || [];
@@ -1591,9 +1593,9 @@ const HELP = `ios.mjs — inspect and drive Safari/Chrome on an iPhone (USB or W
 Element targets (<el>): CSS selector | text=<label> | @e12 (from snapshot) | x y
 
  setup
-  start | stop | status        background bridge (auto-starts on first command)
+  start [--usb|--wifi] | stop | status   background bridge (auto-starts on first command; pick a transport after stop)
   doctor                       check Xcode, the iPhone, and the Safari/Chrome inspector settings
-  launch [safari|chrome|<bundle-id>] [url] [--restart]   bring an app up; with a url Safari opens it in a new tab,
+  launch [safari|chrome|<bundle-id>] [url] [--restart] [--udid id]   bring an app up; with a url Safari opens it in a new tab,
                                or brings forward a tab that already shows that URL
   report [--title t] [--what text]   collect redacted diagnostics and print a prefilled GitHub issue link
 
@@ -1673,7 +1675,7 @@ async function main() {
 	const opts = (dd >= 0 ? rest.slice(0, dd) : rest).flatMap((a) => (/^--[a-z-]+=/.test(a) ? [a.slice(0, a.indexOf('=')), a.slice(a.indexOf('=') + 1)] : [a]));
 	const tail = dd >= 0 ? rest.slice(dd + 1) : [];
 	const flags = new Set(opts.filter((a) => a.startsWith('--')));
-	const valueFlags = new Set(['--out', '--type', '--last', '--computed', '--line', '--if', '--title', '--what']);
+	const valueFlags = new Set(['--udid', '--out', '--type', '--last', '--computed', '--line', '--if', '--title', '--what']);
 	const pos = [...opts.filter((a, i) => !a.startsWith('--') && !valueFlags.has(opts[i - 1])), ...tail];
 	const flagVal = (name) => {
 		const i = opts.indexOf(name);
@@ -1688,7 +1690,7 @@ async function main() {
 		const apps = { safari: 'com.apple.mobilesafari', chrome: 'com.google.chrome.ios' };
 		if (/^[a-z]+:\/\//i.test(pos[0] || '')) pos.unshift('safari'); // `launch <url>` means Safari
 		const bundle = apps[pos[0]] || pos[0] || apps.safari;
-		const udid = await connectedUdid();
+		const udid = await connectedUdid(flagVal('--udid'));
 		const args = ['devicectl', 'device', 'process', 'launch', '--device', udid];
 		if (flags.has('--restart')) args.push('--terminate-existing');
 		if (pos[1]) args.push('--payload-url', pos[1]);
@@ -1713,7 +1715,7 @@ async function main() {
 		return console.log('stopped');
 	}
 
-	await ensureDaemon();
+	await ensureDaemon(cmd === 'start' ? (flags.has('--usb') ? 'usb' : flags.has('--wifi') ? 'wifi' : '') : '');
 
 	switch (cmd) {
 		case 'start':

@@ -8,9 +8,9 @@ ios.mjs — inspect and drive Safari/Chrome on an iPhone (USB or Wi-Fi)
 Element targets (<el>): CSS selector | text=<label> | @e12 (from snapshot) | x y
 
  setup
-  start | stop | status        background bridge (auto-starts on first command)
+  start [--usb|--wifi] | stop | status   background bridge (auto-starts on first command; pick a transport after stop)
   doctor                       check Xcode, the iPhone, and the Safari/Chrome inspector settings
-  launch [safari|chrome|<bundle-id>] [url] [--restart]   bring an app up; with a url Safari opens it in a new tab,
+  launch [safari|chrome|<bundle-id>] [url] [--restart] [--udid id]   bring an app up; with a url Safari opens it in a new tab,
                                or brings forward a tab that already shows that URL
   report [--title t] [--what text]   collect redacted diagnostics and print a prefilled GitHub issue link
 

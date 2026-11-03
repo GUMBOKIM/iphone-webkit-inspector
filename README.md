@@ -114,7 +114,7 @@ Traces, CPU profiles, heap snapshots and HAR files open in Chrome DevTools. Run 
 
 The bridge uses USB when the phone is plugged in. When it isn't, the bridge reuses the Wi-Fi connection macOS
 already keeps to a paired iPhone on the same network (the one Xcode uses), so you don't need to change anything in
-Finder. To pick one yourself, set `IOS_TRANSPORT=usb|wifi`.
+Finder. To pick one yourself, run `ios.mjs stop`, then `ios.mjs start --usb` or `--wifi`.
 
 Tested on an iPhone 15 Pro with iOS 18.6.2, Xcode 27.2, pymobiledevice3 11.49.2.
 
