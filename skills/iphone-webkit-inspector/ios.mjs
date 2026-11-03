@@ -10,20 +10,23 @@
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, openSync, readFileSync, writeFileSync, existsSync, rmSync, chmodSync, statSync } from 'node:fs';
-import { createServer } from 'node:http';
+import { createServer, request } from 'node:http';
+import { createConnection } from 'node:net';
 import { homedir, hostname, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const BRIDGE_PORT = Number(process.env.IOS_BRIDGE_PORT || 9333);
-const DAEMON_PORT = Number(process.env.IOS_DAEMON_PORT || 9334);
 const STATE_DIR = join(homedir(), '.cache', 'iphone-webkit-inspector');
 const LOG_FILE = join(STATE_DIR, 'daemon.log');
 const PID_FILE = join(STATE_DIR, 'daemon.pid');
-const TOKEN_FILE = join(STATE_DIR, 'token');
+// The daemon listens on a Unix socket inside the owner-only state dir: only this user can connect,
+// and web pages can't reach it at all, so no token is needed.
+const SOCKET = join(STATE_DIR, 'daemon.sock');
+// The Web Inspector bridge listens on a Unix socket in the same directory, for the same reason.
+const BRIDGE_SOCKET = join(STATE_DIR, 'bridge.sock');
 const LOCK_FILE = join(STATE_DIR, 'start.lock');
 
-// State dir and log are owner-only: the log names attached tabs and the token guards the daemon.
+// State dir and log are owner-only: the log names attached tabs and the dir guards the daemon socket.
 function ensureStateDir() {
 	mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
 	try {
@@ -47,6 +50,143 @@ const AsyncFunction = (async () => {}).constructor;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---------------------------------------------------------------- daemon
+
+// GET on the bridge's Unix socket.
+function bridgeGet(path) {
+	return new Promise((res, rej) => {
+		const r = request({ socketPath: BRIDGE_SOCKET, path, headers: { host: 'localhost' } }, (x) => {
+			let text = '';
+			x.setEncoding('utf8');
+			x.on('data', (c) => (text += c));
+			x.on('end', () => res({ status: x.statusCode, text }));
+		});
+		r.on('error', rej);
+		r.end();
+	});
+}
+
+// Minimal WebSocket client over a Unix socket (Node's built-in WebSocket only does TCP).
+// Same surface as the browser API where Tab uses it: onopen, onmessage({data}), onerror, onclose, send, close.
+class UnixWebSocket {
+	constructor(socketPath, path) {
+		this.chunks = [];
+		this.len = 0;
+		this.frags = [];
+		const key = randomBytes(16).toString('base64');
+		const req = request({ socketPath, path, headers: { host: 'localhost', connection: 'Upgrade', upgrade: 'websocket', 'sec-websocket-version': '13', 'sec-websocket-key': key } });
+		req.on('upgrade', (_res, sock, head) => {
+			this.sock = sock;
+			sock.on('data', (d) => this.feed(d));
+			sock.on('close', () => this.closed());
+			sock.on('error', (e) => this.onerror?.(e));
+			this.onopen?.();
+			if (head.length) this.feed(head);
+		});
+		req.on('response', (res) => {
+			res.resume();
+			this.onerror?.(new Error(`websocket handshake failed: HTTP ${res.statusCode}`));
+		});
+		req.on('error', (e) => this.onerror?.(e));
+		req.end();
+	}
+
+	feed(d) {
+		this.chunks.push(d);
+		this.len += d.length;
+		for (;;) {
+			if (this.len < 2) return;
+			let h = this.chunks[0];
+			if (h.length < Math.min(14, this.len)) h = this.chunks[0] = Buffer.concat(this.chunks.splice(0));
+			if (this.chunks.length === 0) this.chunks.push(h);
+			let n = h[1] & 127, off = 2;
+			if (n === 126) {
+				if (h.length < 4) return;
+				n = h.readUInt16BE(2);
+				off = 4;
+			} else if (n === 127) {
+				if (h.length < 10) return;
+				n = Number(h.readBigUInt64BE(2));
+				off = 10;
+			}
+			const masked = h[1] & 128;
+			if (masked) off += 4;
+			if (this.len < off + n) return;
+			const fin = h[0] & 128, op = h[0] & 15;
+			const mask = masked ? Buffer.from(h.subarray(off - 4, off)) : null;
+			this.take(off);
+			const payload = this.take(n);
+			if (mask) for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3];
+			if (op === 8) return this.close();
+			if (op === 9) {
+				this.frame(10, payload);
+				continue;
+			}
+			if (op === 10) continue;
+			this.frags.push(payload);
+			if (fin) {
+				const data = Buffer.concat(this.frags.splice(0)).toString('utf8');
+				this.onmessage?.({ data });
+			}
+		}
+	}
+
+	take(n) {
+		this.len -= n;
+		const c = this.chunks[0];
+		if (c.length === n) return this.chunks.shift();
+		if (c.length > n) {
+			this.chunks[0] = c.subarray(n);
+			return Buffer.from(c.subarray(0, n));
+		}
+		const out = Buffer.allocUnsafe(n);
+		let o = 0;
+		while (o < n) {
+			const x = this.chunks[0];
+			const k = Math.min(x.length, n - o);
+			x.copy(out, o, 0, k);
+			o += k;
+			if (k === x.length) this.chunks.shift();
+			else this.chunks[0] = x.subarray(k);
+		}
+		return out;
+	}
+
+	// Client frames must be masked.
+	frame(op, payload) {
+		if (!this.sock || this.sock.destroyed) return;
+		const n = payload.length;
+		const head = n < 126 ? Buffer.alloc(2) : n < 65536 ? Buffer.alloc(4) : Buffer.alloc(10);
+		head[0] = 128 | op;
+		if (n < 126) head[1] = 128 | n;
+		else if (n < 65536) {
+			head[1] = 128 | 126;
+			head.writeUInt16BE(n, 2);
+		} else {
+			head[1] = 128 | 127;
+			head.writeBigUInt64BE(BigInt(n), 2);
+		}
+		const mask = randomBytes(4);
+		const body = Buffer.from(payload);
+		for (let i = 0; i < n; i++) body[i] ^= mask[i & 3];
+		this.sock.write(Buffer.concat([head, mask, body]));
+	}
+
+	send(text) {
+		this.frame(1, Buffer.from(text, 'utf8'));
+	}
+
+	close() {
+		this.frame(8, Buffer.alloc(0));
+		this.sock?.end();
+		this.closed();
+	}
+
+	closed() {
+		if (this.done) return;
+		this.done = true;
+		this.onclose?.();
+	}
+}
 
 class Tab {
 	constructor(info) {
@@ -90,7 +230,7 @@ class Tab {
 	connect(wsUrl) {
 		return new Promise((res, rej) => {
 			// this.ws is set only once the socket is open, so a concurrent refresh never sends on a connecting socket.
-			const ws = new WebSocket(wsUrl);
+			const ws = new UnixWebSocket(BRIDGE_SOCKET, new URL(wsUrl).pathname);
 			ws.onopen = () => {
 				this.ws = ws;
 				res();
@@ -422,20 +562,16 @@ async function runDaemon() {
 	});
 	const transport = process.env.IOS_TRANSPORT || (listed ? 'usb' : 'wifi');
 	log('transport', transport);
-	// bridge_guard.py starts the same bridge but refuses browser (Origin) and non-local Host requests.
-	// The bridge also requires a per-run secret (passed by env, never written to disk), so other local
-	// users can't reach the phone through port 9333 even though they can't read our token file.
+	// bridge_guard.py starts the same bridge on a Unix socket in the owner-only state dir (no TCP port).
 	const guard = fileURLToPath(new URL('./bridge_guard.py', import.meta.url));
-	const bridgeSecret = randomBytes(24).toString('hex');
-	const bridgeUrl = (path) => `http://127.0.0.1:${BRIDGE_PORT}${path}?iwi=${bridgeSecret}`;
-	const withSecret = (wsUrl) => wsUrl + (wsUrl.includes('?') ? '&' : '?') + 'iwi=' + bridgeSecret;
-	const bridge = spawn('uvx', ['--python', '3.12', '--from', PMD3, 'python', guard, 'webinspector', 'cdp', '--port', String(BRIDGE_PORT), ...(transport === 'wifi' ? ['--native'] : [])], { stdio: ['ignore', 'inherit', 'inherit'], env: { ...process.env, IWI_BRIDGE_SECRET: bridgeSecret } });
-	// Removes the pid/token files only if they are ours; another daemon may have written them.
+	rmSync(BRIDGE_SOCKET, { force: true });
+	const bridge = spawn('uvx', ['--python', '3.12', '--from', PMD3, 'python', guard, BRIDGE_SOCKET, 'webinspector', 'cdp', ...(transport === 'wifi' ? ['--native'] : [])], { stdio: ['ignore', 'inherit', 'inherit'] });
+	// Removes the pid/socket files only if they are ours; another daemon may have written them.
 	const releaseState = () => {
 		try {
 			if (readFileSync(PID_FILE, 'utf8').trim() === String(process.pid)) {
 				rmSync(PID_FILE, { force: true });
-				rmSync(TOKEN_FILE, { force: true });
+				rmSync(SOCKET, { force: true });
 			}
 		} catch {}
 	};
@@ -459,7 +595,7 @@ async function runDaemon() {
 
 	for (let i = 0; ; i++) {
 		try {
-			await fetch(bridgeUrl('/json'));
+			if ((await bridgeGet('/json')).status !== 200) throw new Error('not ready');
 			break;
 		} catch {
 			if (i > 120) throw new Error('bridge did not start');
@@ -478,7 +614,7 @@ async function runDaemon() {
 		return (refreshing ||= doRefreshTabs().finally(() => (refreshing = null)));
 	}
 	async function doRefreshTabs() {
-		const list = await (await fetch(bridgeUrl('/json'))).json();
+		const list = JSON.parse((await bridgeGet('/json')).text);
 		const pages = list.filter((t) => t.type === 'page' && t.webSocketDebuggerUrl);
 		const seen = new Set();
 		await Promise.all(
@@ -494,7 +630,7 @@ async function runDaemon() {
 				tabs.set(info.id, tab);
 				try {
 					// Connect only; domains are enabled when the tab becomes the one being worked on.
-					await tab.connect(withSecret(info.webSocketDebuggerUrl));
+					await tab.connect(info.webSocketDebuggerUrl);
 					log('attached', info.id, originOf(info.url));
 				} catch (e) {
 					log('attach failed', info.id, e.message);
@@ -588,7 +724,7 @@ async function runDaemon() {
 
 	const handlers = {
 		async status() {
-			return { bridge: BRIDGE_PORT, transport, tabs: tabs.size, current };
+			return { transport, tabs: tabs.size, current };
 		},
 		async tabs() {
 			const states = await tabStates();
@@ -1146,16 +1282,11 @@ async function runDaemon() {
 		},
 	};
 
-	// Only ios.mjs may talk to the daemon: it must present the token from TOKEN_FILE (readable by
-	// this user only). Browser requests are refused outright (they carry Origin; a page can't set
-	// the token header without a CORS preflight, which is never answered), and so are Hosts other
-	// than 127.0.0.1 (DNS rebinding).
-	const token = randomBytes(24).toString('hex');
+	// Only this user can open the socket (it lives in a 0700 directory).
 	const server = createServer(async (req, res) => {
 		try {
-			const host = String(req.headers.host || '').replace(/:\d+$/, '');
-			if (req.headers.origin || req.headers['x-iwi-token'] !== token || !['127.0.0.1', 'localhost'].includes(host) || req.method !== 'POST') {
-				res.writeHead(403).end();
+			if (req.method !== 'POST') {
+				res.writeHead(405).end();
 				req.resume();
 				return;
 			}
@@ -1182,16 +1313,32 @@ async function runDaemon() {
 		}
 	});
 	server.on('error', (e) => {
-		// Port taken (another daemon won the race): leave its pid/token alone and exit.
+		// Socket taken (another daemon won the race): leave its pid/socket alone and exit.
 		log('daemon could not listen', e.message);
 		bridge.kill();
 		process.exit(1);
 	});
-	server.listen(DAEMON_PORT, '127.0.0.1', () => {
-		// Published only after binding, so a daemon that loses the port never overwrites the winner's token.
-		writeFileSync(TOKEN_FILE, token, { mode: 0o600 });
+	// A socket file nobody answers on is left over from a crash; remove it before listening.
+	const alive = await new Promise((res) => {
+		const c = createConnection(SOCKET);
+		c.on('connect', () => {
+			c.destroy();
+			res(true);
+		});
+		c.on('error', () => res(false));
+	});
+	if (alive) {
+		log('another daemon is already running');
+		bridge.kill();
+		process.exit(1);
+	}
+	rmSync(SOCKET, { force: true });
+	server.listen(SOCKET, () => {
+		try {
+			chmodSync(SOCKET, 0o600);
+		} catch {}
 		writeFileSync(PID_FILE, String(process.pid), { mode: 0o600 });
-		log('daemon ready on', DAEMON_PORT);
+		log('daemon ready on', SOCKET);
 	});
 
 	refreshTabs().catch((e) => log('initial attach failed', e.message));
@@ -1200,13 +1347,19 @@ async function runDaemon() {
 // ---------------------------------------------------------------- client
 
 async function call(cmd, args = {}) {
-	let token = '';
-	try {
-		token = readFileSync(TOKEN_FILE, 'utf8').trim();
-	} catch {}
-	const r = await fetch(`http://127.0.0.1:${DAEMON_PORT}/${cmd}`, { method: 'POST', headers: { 'x-iwi-token': token, 'content-type': 'application/json' }, body: JSON.stringify(args) });
-	if (r.status === 403) throw new Error('daemon refused the request (stale token?) — run `ios.mjs stop` and retry');
-	const d = await r.json();
+	const text = await new Promise((res, rej) => {
+		const body = JSON.stringify(args);
+		const req = request({ socketPath: SOCKET, path: '/' + cmd, method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (r) => {
+			let out = '';
+			r.setEncoding('utf8');
+			r.on('data', (c) => (out += c));
+			r.on('end', () => res(out));
+			r.on('error', rej);
+		});
+		req.on('error', rej);
+		req.end(body);
+	});
+	const d = JSON.parse(text);
 	if (!d.ok) throw new Error(d.error);
 	return d.result;
 }
@@ -1222,9 +1375,6 @@ async function daemonUp() {
 
 async function ensureDaemon() {
 	if (await daemonUp()) return;
-	// Something answers on the daemon port but refuses us: a daemon from another install or a stale token.
-	const probe = await fetch(`http://127.0.0.1:${DAEMON_PORT}/status`, { method: 'POST' }).catch(() => null);
-	if (probe) throw new Error(`port ${DAEMON_PORT} is in use by a daemon that refuses this client; stop it (pkill -f "ios.mjs __daemon") and retry`);
 	ensureStateDir();
 	// One starter at a time; a lock older than 2 minutes is from a crashed start and is taken over.
 	let starter = false;
@@ -1347,13 +1497,8 @@ async function doctor(skipChrome) {
 }
 
 const REPO = 'GUMBOKIM/iphone-webkit-inspector';
-const PLUGIN_VERSION = (() => {
-	try {
-		return JSON.parse(readFileSync(new URL('../../.claude-plugin/plugin.json', import.meta.url), 'utf8')).version;
-	} catch {
-		return 'unknown';
-	}
-})();
+// Keep in sync with .claude-plugin/plugin.json.
+const PLUGIN_VERSION = '0.6.0';
 
 // Collects versions, the device model, doctor output and the daemon log tail into an issue body.
 // Device and Mac names, UDIDs, home paths and visited URLs are redacted.

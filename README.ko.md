@@ -125,13 +125,13 @@ iPhone 15 Pro, iOS 18.6.2, Xcode 27.2, pymobiledevice3 11.49.2에서 시험했�
 
 ## 무엇을 실행하고 어디에 연결하나
 
-- `node skills/iphone-webkit-inspector/ios.mjs`: Claude가 부르는 CLI입니다. 소스를 그대로 읽어 볼 수 있고 npm 의존성도 없습니다. 첫 명령을 실행할 때 같은 스크립트가 백그라운드 데몬으로 뜨는데, 이 데몬은 `127.0.0.1:9334`에서만 연결을 받습니다.
-- `uvx --from pymobiledevice3==11.49.2 python bridge_guard.py webinspector cdp --port 9333`: Web Inspector 브리지입니다. 이쪽도 `127.0.0.1:9333`에서만 연결을 받습니다. 처음 실행하면 `uv`가 PyPI에서 이 버전의 pymobiledevice3를 내려받고, Python 3.12가 없으면 uv가 관리하는 Python 3.12도 받습니다.
-- `bridge_guard.py`는 브리지 앞에서 웹페이지가 보낸 요청(`Origin` 헤더가 있는 요청)과 Host가 `127.0.0.1`/`localhost`가 아닌 요청을 막습니다. 그래서 Mac에 열어 둔 웹사이트가 브리지를 거쳐 아이폰에 닿을 수 없습니다. 브리지는 데몬이 환경 변수로 넘겨주는 실행마다 다른 비밀값도 요구하므로, 같은 Mac의 다른 사용자도 쓸 수 없습니다. 데몬은 따로 실행마다 만드는 랜덤 토큰이 있어야 명령을 받고, 이 토큰은 `~/.cache/iphone-webkit-inspector/token`에 본인만 읽을 수 있게(권한 600) 저장합니다. 다른 로컬 개발 도구와 마찬가지로, 같은 사용자 권한으로 도는 프로세스는 이 토큰을 읽을 수 있습니다.
+- `node skills/iphone-webkit-inspector/ios.mjs`: Claude가 부르는 CLI입니다. 소스를 그대로 읽어 볼 수 있고 npm 의존성도 없습니다. 첫 명령을 실행할 때 같은 스크립트가 백그라운드 데몬으로 뜨는데, 이 데몬은 네트워크 포트를 열지 않고 Unix 소켓(`~/.cache/iphone-webkit-inspector/daemon.sock`)으로만 연결을 받습니다.
+- `uvx --from pymobiledevice3==11.49.2 python bridge_guard.py <소켓> webinspector cdp`: Web Inspector 브리지입니다. 처음 실행하면 `uv`가 PyPI에서 이 버전의 pymobiledevice3를 내려받고, Python 3.12가 없으면 uv가 관리하는 Python 3.12도 받습니다.
+- `bridge_guard.py`는 pymobiledevice3가 원래 여는 TCP 포트 대신 `~/.cache/iphone-webkit-inspector/bridge.sock` 소켓으로 브리지를 띄우고, `Origin` 헤더가 붙은 요청(웹페이지가 보낸 요청)은 막습니다. 두 소켓 모두 본인만 열 수 있는 폴더(권한 700) 안에 있어서 같은 Mac의 다른 사용자는 닿을 수 없고, 웹페이지는 Unix 소켓에 아예 접근하지 못합니다. 토큰이나 비밀값은 쓰지 않습니다.
 - `xcrun devicectl`: 아이폰을 찾고 Safari나 Chrome을 실행합니다.
 - 브리지가 아이폰에 붙는 길은 USB면 macOS의 `usbmuxd`, Wi-Fi면 macOS가 Xcode용으로 열어 두는 CoreDevice 터널(`--native`)입니다. 어느 쪽이든 Mac과 아이폰 사이에서만 오갑니다.
 - 아이폰에서 여는 페이지는 평소처럼 인터넷에서 불러오지만, 플러그인 자체가 바깥으로 보내는 것은 없습니다. `report`도 링크만 출력하고, 이슈를 올릴지는 사용자가 정합니다.
-- 디스크에 쓰는 파일: `~/.cache/iphone-webkit-inspector/`(데몬 pid, 토큰, 로그), 그리고 요청한 스크린샷, 트레이스, 프로파일, 힙 스냅샷, HAR, 녹화 파일(기본 위치는 시스템 임시 폴더)
+- 디스크에 쓰는 파일: `~/.cache/iphone-webkit-inspector/`(데몬 pid, 소켓 2개, 로그), 그리고 요청한 스크린샷, 트레이스, 프로파일, 힙 스냅샷, HAR, 녹화 파일(기본 위치는 시스템 임시 폴더)
 - `eval`, `tap`, `type`, `mock`, `block`, `inject`, `ua`, `js`, 디버거는 개발자 도구에서처럼 아이폰의 페이지를 실제로 바꿉니다. 그래서 Claude는 이 명령들을 사용자가 지정한 탭에서만 써야 합니다.
 
 ## 개인정보

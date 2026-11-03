@@ -131,22 +131,21 @@ To check your setup, ask Claude to run `doctor`.
 ## What it runs and connects to
 
 - `node skills/iphone-webkit-inspector/ios.mjs` is the CLI Claude calls. It's plain readable source with no npm
-  dependencies. The first command starts a background daemon (same script) that listens on `127.0.0.1:9334` only.
-- `uvx --from pymobiledevice3==11.49.2 python bridge_guard.py webinspector cdp --port 9333` is the Web Inspector
-  bridge. It listens on `127.0.0.1:9333` only. The first time, `uv` downloads that exact pymobiledevice3 version from
-  PyPI, and a uv-managed Python 3.12 if you don't have one.
-- `bridge_guard.py` wraps the bridge and refuses requests from web pages (anything with an `Origin` header) and
-  requests with a Host other than `127.0.0.1`/`localhost`, so a site open on your Mac can't reach your phone through
-  it. It also requires a random per-run secret that the daemon passes to it in an environment variable, so other
-  users on the same Mac can't use it either. The daemon requires its own random per-run token, stored in
-  `~/.cache/iphone-webkit-inspector/token` (mode 600). Other processes running as you can read that token, the
-  same as with any local developer tool.
+  dependencies. The first command starts a background daemon (same script) that listens on a Unix socket,
+  `~/.cache/iphone-webkit-inspector/daemon.sock`. It opens no network port.
+- `uvx --from pymobiledevice3==11.49.2 python bridge_guard.py <socket> webinspector cdp` is the Web Inspector
+  bridge. The first time, `uv` downloads that exact pymobiledevice3 version from PyPI, and a uv-managed Python 3.12
+  if you don't have one.
+- `bridge_guard.py` makes the bridge listen on `~/.cache/iphone-webkit-inspector/bridge.sock` instead of the TCP
+  port pymobiledevice3 would open, and refuses any request with an `Origin` header. Both sockets sit in a folder only
+  you can open (mode 700), so other users on the Mac can't reach your phone through them, and web pages can't reach
+  Unix sockets at all. There are no tokens or secrets.
 - `xcrun devicectl` lists the iPhone and launches Safari or Chrome on it.
 - The bridge reaches the iPhone through macOS's `usbmuxd` over USB, or over Wi-Fi through the CoreDevice
   tunnel macOS already keeps up for Xcode (`--native`). Either way the traffic stays between your Mac and your phone.
 - Pages you open on the phone load from the network as usual. The plugin itself doesn't send anything anywhere.
   `report` only prints a link; you decide whether to open it and file the issue.
-- It writes the daemon pid, token and log to `~/.cache/iphone-webkit-inspector/`. Screenshots, traces, profiles, heap
+- It writes the daemon pid, the two sockets and the log to `~/.cache/iphone-webkit-inspector/`. Screenshots, traces, profiles, heap
   snapshots, HAR files and recordings you ask for go to the system temp folder by default.
 - `eval`, `tap`, `type`, `mock`, `block`, `inject`, `ua`, `js` and the debugger change the page on the phone the way
   DevTools would. Claude should only use them on tabs you point it at.

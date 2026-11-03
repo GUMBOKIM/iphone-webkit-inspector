@@ -1,7 +1,7 @@
 {
   "name": "iphone-webkit-inspector",
   "displayName": "iPhone WebKit Inspector",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Inspect and drive Safari or Chrome on a real iPhone over USB or Wi-Fi: run JS, tap, console, network with bodies, request mocking, screenshots, screen recording, performance traces, CPU profiles and heap snapshots.",
   "author": {
     "name": "GUMBOKIM",
