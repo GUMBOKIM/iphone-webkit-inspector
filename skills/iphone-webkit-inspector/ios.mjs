@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 // Inspect and drive Safari or Chrome on an iPhone over USB or Wi-Fi.
 //
 // A background daemon starts the pymobiledevice3 CDP bridge, holds one WebSocket per Safari tab
@@ -1500,7 +1499,7 @@ async function doctor(skipChrome) {
 
 const REPO = 'GUMBOKIM/iphone-webkit-inspector';
 // Keep in sync with the plugin manifest's version.
-const PLUGIN_VERSION = '0.6.1';
+const PLUGIN_VERSION = '0.6.2';
 
 // Collects versions, the device model, doctor output and the daemon log tail into an issue body.
 // Device and Mac names, UDIDs, home paths and visited URLs are redacted.
@@ -1535,7 +1534,7 @@ async function report({ title, what }) {
 		if (host && host.length > 3) out = out.replaceAll(host, '<mac>');
 		return out;
 	};
-	const env = [
+	const versions = [
 		`plugin: ${PLUGIN_VERSION}`,
 		`macOS: ${await line('sw_vers', ['-productVersion'])}`,
 		`Xcode: ${await line('xcodebuild', ['-version'])}`,
@@ -1545,7 +1544,7 @@ async function report({ title, what }) {
 		`device: ${dev ? `${dev.hardwareProperties?.marketingName || dev.hardwareProperties?.productType} / iOS ${dev.deviceProperties?.osVersionNumber} / ${dev.connectionProperties?.transportType}` : 'none found'}`,
 		`daemon: ${status}`,
 	].join('\n');
-	const body = redact(`### What happened\n\n${what || '<!-- what you ran and what went wrong -->'}\n\n### Environment\n\n\`\`\`\n${env}\n\`\`\`\n\n### doctor\n\n\`\`\`\n${doc}\n\`\`\`\n\n### Daemon log (last 60 lines)\n\n\`\`\`\n${log || '(empty)'}\n\`\`\`\n`);
+	const body = redact(`### What happened\n\n${what || '<!-- what you ran and what went wrong -->'}\n\n### Environment\n\n\`\`\`\n${versions}\n\`\`\`\n\n### doctor\n\n\`\`\`\n${doc}\n\`\`\`\n\n### Daemon log (last 60 lines)\n\n\`\`\`\n${log || '(empty)'}\n\`\`\`\n`);
 	const file = join(tmpdir(), `iphone-webkit-inspector-report-${Date.now()}.md`);
 	writeFileSync(file, body);
 	const t = redact(title || 'Bug: ');
