@@ -1,0 +1,17 @@
+{
+  "name": "iphone-webkit-inspector",
+  "description": "Claude Code plugin for inspecting and driving Safari or Chrome on a real iPhone through Web Inspector.",
+  "owner": {
+    "name": "GUMBOKIM",
+    "url": "https://github.com/GUMBOKIM"
+  },
+  "plugins": [
+    {
+      "name": "iphone-webkit-inspector",
+      "source": "./",
+      "description": "Inspect and drive Safari or Chrome on a USB-connected iPhone through Web Inspector.",
+      "category": "development",
+      "tags": ["ios", "safari", "mobile", "debugging", "performance"]
+    }
+  ]
+}

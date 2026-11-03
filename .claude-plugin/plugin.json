@@ -1,0 +1,14 @@
+{
+  "name": "iphone-webkit-inspector",
+  "displayName": "iPhone WebKit Inspector",
+  "version": "0.1.0",
+  "description": "Inspect and drive Safari or Chrome on a USB-connected iPhone: run JS, tap, console, network with bodies, request mocking, screenshots, screen recording, performance traces, CPU profiles and heap snapshots.",
+  "author": {
+    "name": "GUMBOKIM",
+    "url": "https://github.com/GUMBOKIM"
+  },
+  "homepage": "https://github.com/GUMBOKIM/iphone-webkit-inspector",
+  "repository": "https://github.com/GUMBOKIM/iphone-webkit-inspector",
+  "license": "MIT",
+  "keywords": ["ios", "iphone", "safari", "webkit", "web-inspector", "cdp", "mobile", "debugging", "performance"]
+}
