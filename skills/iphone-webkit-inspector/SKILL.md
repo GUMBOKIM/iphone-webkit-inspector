@@ -41,7 +41,8 @@ the exact flags; `ios help` prints the same list.
 
 Look before acting. `ios snapshot` lists what's on screen as `@eN` refs with role, name and box; act with
 `ios tap @eN` / `ios type @eN <text>`. Refs reset on every snapshot and navigation, so snapshot again after the
-page changes. `ios shot <path>` and reading the PNG is the fastest way to see the page; `ios shot <path> --device` shows the
+page changes. If `tap` returns `covered: true`, nothing was tapped: snapshot again. If a command says the tab
+closed, run `ios tabs` and `ios use` the right one; commands won't switch tabs on their own. `ios shot <path>` and reading the PNG is the fastest way to see the page; `ios shot <path> --device` shows the
 whole screen as the user sees it, including Safari's address bar, toolbar and the keyboard.
 
 Pick the tool by question:
@@ -68,7 +69,7 @@ Some commands change the page on the phone. Undo them when done, because the use
 **"아이폰에서 이 페이지 레이아웃 깨지는지 봐줘"**
 ```
 ios launch safari https://example.com/pricing
-ios shot /tmp/pricing.png            → read the image
+ios shot                             → prints the PNG path; read the image
 ios snapshot                         → find the element that overflows
 ios dom @e9
 ios styles @e9 --computed width,height,overflow
@@ -77,11 +78,12 @@ Report what's wrong, the CSS rule and file it comes from, and the screenshot pat
 
 **"Why does the blog load slowly on my phone?"**
 ```
-ios open https://example.com/
+ios launch safari https://example.com/
+ios tabs                             → check the new tab is current
 ios perf --slow                      → TTFB, FCP, slowest resources
 ios trace start
 ios reload
-ios trace stop /tmp/trace.json       → main-thread time, long tasks
+ios trace stop                       → where time went, long events
 ```
 Lead with the numbers, then name the biggest cost and the file that causes it.
 
@@ -94,7 +96,7 @@ Lead with the numbers, then name the biggest cost and the file that causes it.
   the user to do those.
 - While the debugger is paused, the page is frozen and `eval` times out.
 - A trace across a navigation to another site comes back nearly empty; trace a same-site reload.
-- Safari on iOS 18 reports no LCP. There's no network or CPU throttling; for slow networks the user turns on
+- Safari on iOS 18 reports no LCP or CLS. There's no network or CPU throttling; for slow networks the user turns on
   Settings → Developer → Network Link Conditioner.
 - If commands hang after the phone slept, `ios stop` and retry.
 
@@ -104,6 +106,7 @@ If a command fails in a way that looks like a bug in this plugin (not a locked p
 explains), say so and offer to report it. With the user's OK, run
 `ios report --title "<summary>" --what "<command, expected, actual>"`. It writes a redacted report and prints a
 prefilled GitHub issue link for `GUMBOKIM/iphone-webkit-inspector`. Give the user the link and the report path;
-they read it and file the issue themselves.
+they read it and file the issue themselves. `report` runs `doctor`, which may bring Safari to the front and resets
+which tab is current.
 
 Daemon log: `~/.cache/iphone-webkit-inspector/daemon.log`.

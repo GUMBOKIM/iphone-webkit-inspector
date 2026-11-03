@@ -20,7 +20,7 @@ Element targets (<el>): CSS selector | text=<label> | @e12 (from snapshot) | x y
   open <url> | reload | close  navigate (waits for load, clears logs/net) | reload | close tab
   snapshot [--all]             elements you can act on, as @eN refs
   eval <js> [--gesture]        run JS; expression, or statements with return/await
-  tap <el>                     touch + click, run as a user gesture
+  tap <el>                     touch + click as a user gesture; refuses if covered; "x y" = exact point
   type <el> <text>             set an input's value and fire input/change
   shot [path] [--device]       screenshot of the page; --device = whole screen incl. Safari's bars and keyboard
   record start [dir] | record stop      screen recording as JPEG frames named <n>-<ms>ms.jpg
@@ -39,7 +39,7 @@ Element targets (<el>): CSS selector | text=<label> | @e12 (from snapshot) | x y
   net [url-part] [--failed]    requests: id status type size time url
   req <id|url-part>            request + response headers, post data
   body <id|url-part> [--out f] response body
-  har [out.har]                export recorded requests as HAR
+  har [out.har]                export recorded requests as HAR (no redirect hops or per-phase timings)
   ws                           WebSocket frames
   block <url-part>             fail matching requests
   mock <url-part> <status> <body|@file> [--type ct]   answer matching requests yourself
@@ -93,8 +93,9 @@ forward a tab already showing that URL; commands then follow the visible tab. `c
 off-screen elements, marked `offscreen`. Boxes are `x,y,width,height` in CSS pixels.
 
 **tap / type.** In-page events (pointer, touch, mouse, click) run with WebKit's user-gesture emulation, so things
-that need a user gesture (audio start, fullscreen, `window.open`) are allowed. `tap` reports `covered: true` when
-another element sits on top of the target at its center. `type` uses the native value setter, so React-style
+that need a user gesture (audio start, fullscreen, `window.open`) are allowed. If another element sits on top of the target's center, `tap` doesn't tap
+anything and returns `covered: true` with what covers it; take a new snapshot. `tap x y` taps exactly that point.
+To pass text that starts with `--` (to `type`, `mock` and others), put it after a bare `--`. `type` uses the native value setter, so React-style
 inputs notice the change.
 
 **styles.** Matched rules come back most specific first, with `file:line` (minified CSS is usually line 1).
@@ -106,7 +107,8 @@ JS that runs, which may be never on an idle page. Breakpoints match the script U
 lines; minified files are one line, so prefer `pause-on uncaught` or `debugger;` via `inject` for those.
 
 **trace.** Start, then `reload` or interact on the same site, then stop. A navigation to another site swaps Safari's
-process and loses the trace. Summary shows main-thread time per event type and tasks over 50ms; the JSON opens in
+process and loses the trace. Summary shows time per event type and events over 50ms. These are inclusive times across all threads, and
+nested events overlap, so read them as "where time went", not exact main-thread totals. The JSON opens in
 Chrome DevTools → Performance → Load profile.
 
 **profile.** Sample shares per function. The bridge's sample timing is unreliable, so there are no milliseconds.

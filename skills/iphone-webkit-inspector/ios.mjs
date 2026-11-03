@@ -9,7 +9,7 @@
 
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, openSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdirSync, openSync, readFileSync, writeFileSync, existsSync, rmSync, chmodSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { homedir, hostname, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -21,10 +21,29 @@ const STATE_DIR = join(homedir(), '.cache', 'iphone-webkit-inspector');
 const LOG_FILE = join(STATE_DIR, 'daemon.log');
 const PID_FILE = join(STATE_DIR, 'daemon.pid');
 const TOKEN_FILE = join(STATE_DIR, 'token');
+const LOCK_FILE = join(STATE_DIR, 'start.lock');
+
+// State dir and log are owner-only: the log names attached tabs and the token guards the daemon.
+function ensureStateDir() {
+	mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+	try {
+		chmodSync(STATE_DIR, 0o700);
+	} catch {}
+}
+
+// Only the origin of a page goes into the log, never its path or query.
+const originOf = (u) => {
+	try {
+		return new URL(u).origin;
+	} catch {
+		return '?';
+	}
+};
 const MAX_EVENTS = 3000;
 // Exact version the bridge was tested with; override with IOS_PMD3_VERSION.
 const PMD3 = `pymobiledevice3==${process.env.IOS_PMD3_VERSION || '11.49.2'}`;
 
+const AsyncFunction = (async () => {}).constructor;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---------------------------------------------------------------- daemon
@@ -70,15 +89,27 @@ class Tab {
 
 	connect(wsUrl) {
 		return new Promise((res, rej) => {
-			this.ws = new WebSocket(wsUrl);
-			this.ws.onopen = () => res();
-			this.ws.onerror = (e) => rej(new Error(`ws error on ${this.id}: ${e.message || 'unknown'}`));
-			this.ws.onclose = () => {
+			// this.ws is set only once the socket is open, so a concurrent refresh never sends on a connecting socket.
+			const ws = new WebSocket(wsUrl);
+			ws.onopen = () => {
+				this.ws = ws;
+				res();
+			};
+			ws.onerror = (e) => rej(new Error(`ws error on ${this.id}: ${e.message || 'unknown'}`));
+			ws.onclose = () => {
 				this.ws = null;
 				for (const [, p] of this.pending) p({ error: { message: 'connection closed' } });
 				this.pending.clear();
 			};
-			this.ws.onmessage = (m) => this.onMessage(JSON.parse(m.data));
+			ws.onmessage = (m) => {
+				let d;
+				try {
+					d = JSON.parse(m.data);
+				} catch {
+					return;
+				}
+				this.onMessage(d);
+			};
 		});
 	}
 
@@ -109,16 +140,26 @@ class Tab {
 			return;
 		}
 		const p = d.params || {};
-		if (this.trace) this.trace.push({ t: Date.now(), method: d.method, params: p });
+		// usage keeps only CPU and memory samples, plus a request count; no headers or bodies.
+		if (this.trace) {
+			if (/^(CPUProfiler|Memory)\.trackingUpdate$/.test(d.method)) this.trace.push({ t: Date.now(), method: d.method, params: p });
+			else if (d.method === 'Network.requestWillBeSent') this.traceRequests = (this.traceRequests || 0) + 1;
+		}
 		// Big payload events (trace chunks, frames, heap chunks) go to listeners only, not the ring buffer.
 		if (!/^(Tracing\.dataCollected|Page\.screencastFrame|HeapProfiler\.addHeapSnapshotChunk)$/.test(d.method)) {
 			this.events.push({ t: Date.now(), method: d.method, params: p });
 			if (this.events.length > MAX_EVENTS) this.events.splice(0, this.events.length - MAX_EVENTS);
 		}
-		for (const fn of this.listeners.get(d.method) || []) fn(p);
+		for (const fn of this.listeners.get(d.method) || []) {
+			try {
+				fn(p);
+			} catch (e) {
+				console.log(new Date().toISOString(), 'listener failed', d.method, e.message);
+			}
+		}
 		switch (d.method) {
 			case 'Fetch.requestPaused':
-				this.onRequestPaused(p);
+				this.onRequestPaused(p).catch(() => {});
 				break;
 			case 'Runtime.consoleAPICalled':
 				this.pushLog({ kind: 'console', level: p.type, text: (p.args || []).map(fmtRemote).join(' '), where: p.stackTrace?.callFrames?.[0] && frameStr(p.stackTrace.callFrames[0]) });
@@ -137,7 +178,7 @@ class Tab {
 				break;
 			case 'Network.responseReceived': {
 				const r = this.requests.get(p.requestId);
-				if (r) Object.assign(r, { status: p.response.status, mime: p.response.mimeType, headers: p.response.headers, type: p.type || r.type });
+				if (r) Object.assign(r, { status: p.response.status, mime: p.response.mimeType, headers: p.response.headers, type: p.type || r.type, protocol: p.response.protocol });
 				break;
 			}
 			case 'Network.loadingFinished': {
@@ -157,6 +198,12 @@ class Tab {
 				if (!p.frame?.parentId && p.frame?.url) this.url = p.frame.url;
 				break;
 		}
+	}
+
+	// Domains are enabled only on the tab being worked on, so other tabs' traffic is never recorded.
+	enableOnce() {
+		this.enabled ||= this.enable();
+		return this.enabled;
 	}
 
 	async enable() {
@@ -208,7 +255,7 @@ const frameStr = (f) => `${f.url}:${f.lineNumber}`;
 // Chrome trace → page milestones, where main-thread time went, and the longest tasks.
 function summarizeTrace(events) {
 	const timed = events.filter((e) => typeof e.ts === 'number' && e.ts > 0);
-	const t0 = Math.min(...timed.map((e) => e.ts));
+	const t0 = timed.reduce((m, e) => Math.min(m, e.ts), Infinity);
 	const ms = (us) => Math.round(us / 100) / 10;
 	const markNames = /navigationStart|firstPaint|firstContentfulPaint|largestContentfulPaint|domContentLoadedEventEnd|loadEventEnd|MarkDOMContent|MarkLoad|firstMeaningfulPaint/i;
 	const marks = {};
@@ -231,7 +278,9 @@ function summarizeTrace(events) {
 		.sort((a, b) => b.dur - a.dur)
 		.slice(0, 10)
 		.map((e) => ({ at: ms(e.ts - t0), ms: Math.round(e.dur / 1000), name: e.name, detail: detail(e) }));
-	return { events: events.length, spanMs: timed.length ? ms(Math.max(...timed.map((e) => e.ts + (e.dur || 0))) - t0) : 0, marks, top, long };
+	const end = timed.reduce((m, e) => Math.max(m, e.ts + (e.dur || 0)), 0);
+	// Durations are inclusive (nested events overlap) and cover every thread in the trace.
+	return { events: events.length, spanMs: timed.length ? ms(end - t0) : 0, marksFromTraceStart: marks, inclusiveMsByEvent: top, longEvents: long, note: 'inclusive times across all threads; nested events overlap, so totals can exceed wall time' };
 }
 
 // .cpuprofile → share of samples per function. The bridge's timeDeltas are unreliable (mostly 0 with
@@ -257,8 +306,8 @@ function summarizeProfile(profile) {
 		}
 	}
 	const idle = /^\((root|program|idle|garbage collector)\)/;
-	const busy = [...self].filter(([k]) => !idle.test(k)).reduce((a, [, c]) => a + c, 0) || 1;
-	const fmt = (m) => [...m].sort((a, b) => b[1] - a[1]).filter(([k]) => !idle.test(k)).slice(0, 12).map(([fn, c]) => ({ fn, samples: c, pct: Math.round((c / busy) * 100) }));
+	const busy = [...self].filter(([k]) => !idle.test(k)).reduce((a, [, c]) => a + c, 0);
+	const fmt = (m) => [...m].sort((a, b) => b[1] - a[1]).filter(([k]) => !idle.test(k)).slice(0, 12).map(([fn, c]) => ({ fn, samples: c, pct: Math.round((c / (busy || 1)) * 100) }));
 	return { durationMs: Math.round((profile.endTime - profile.startTime) / 1000), samples: profile.samples?.length || 0, busySamples: busy, topSelf: fmt(self), topTotal: fmt(total) };
 }
 
@@ -293,7 +342,9 @@ const SNAPSHOT_JS = `
 		el.setAttribute('data-iwi-ref', ref);
 		const tag = el.tagName.toLowerCase();
 		const role = el.getAttribute('role') || (tag === 'a' ? 'link' : /^h\\d$/.test(tag) ? 'heading' : tag === 'input' ? 'input:' + (el.type || 'text') : tag);
-		const name = (el.getAttribute('aria-label') || el.innerText || el.value || el.placeholder || el.title || el.alt || el.getAttribute('href') || '').trim().replace(/\\s+/g, ' ').slice(0, 70);
+		const secret = tag === 'input' && /^(password|hidden)$/i.test(el.type || '') || /cc-|one-time-code|current-password|new-password/.test(el.autocomplete || '');
+		const label = el.labels && el.labels[0] ? el.labels[0].innerText : '';
+		const name = (el.getAttribute('aria-label') || label || el.innerText || (secret ? (el.value ? '(filled)' : '') : el.value) || el.placeholder || el.title || el.alt || el.getAttribute('href') || '').trim().replace(/\\s+/g, ' ').slice(0, 70);
 		const state = [el.disabled && 'disabled', el.checked && 'checked', el.getAttribute('aria-pressed') === 'true' && 'pressed', el.getAttribute('aria-expanded') === 'true' && 'expanded', document.activeElement === el && 'focused', (r.bottom < 0 || r.top > vh) && 'offscreen'].filter(Boolean).join(',');
 		out.push({ ref, role, name, state, box: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)] });
 	}
@@ -313,12 +364,23 @@ const PERF_JS = `
 			setTimeout(() => { po.disconnect(); res(last && { ms: r(last.startTime), el: last.element && (last.element.tagName + (last.element.id ? '#' + last.element.id : '') + (last.element.className && typeof last.element.className === 'string' ? '.' + last.element.className.trim().split(/\\s+/)[0] : '')), url: last.url || '' }); }, 300);
 		} catch { res(null); }
 	});
+	// CLS = the largest session window (shifts < 1s apart, window < 5s). null when not supported.
 	const cls = await new Promise((res) => {
-		let sum = 0;
+		if (!(PerformanceObserver.supportedEntryTypes || []).includes('layout-shift')) return res(null);
+		const shifts = [];
 		try {
-			const po = new PerformanceObserver((l) => { for (const e of l.getEntries()) if (!e.hadRecentInput) sum += e.value; });
+			const po = new PerformanceObserver((l) => { for (const e of l.getEntries()) if (!e.hadRecentInput) shifts.push(e); });
 			po.observe({ type: 'layout-shift', buffered: true });
-			setTimeout(() => { po.disconnect(); res(Math.round(sum * 1000) / 1000); }, 300);
+			setTimeout(() => {
+				po.disconnect();
+				let best = 0, cur = 0, start = 0, prev = 0;
+				for (const e of shifts) {
+					if (cur && (e.startTime - prev > 1000 || e.startTime - start > 5000)) cur = 0;
+					if (!cur) start = e.startTime;
+					cur += e.value; prev = e.startTime; best = Math.max(best, cur);
+				}
+				res(Math.round(best * 1000) / 1000);
+			}, 300);
 		} catch { res(null); }
 	});
 	const res = performance.getEntriesByType('resource').map((e) => ({
@@ -345,7 +407,7 @@ const PERF_JS = `
 `;
 
 async function runDaemon() {
-	mkdirSync(STATE_DIR, { recursive: true });
+	ensureStateDir();
 	const log = (...a) => console.log(new Date().toISOString(), ...a);
 
 	// Over USB the phone is listed by usbmuxd. Over Wi-Fi it usually isn't, but macOS keeps its own
@@ -361,24 +423,43 @@ async function runDaemon() {
 	const transport = process.env.IOS_TRANSPORT || (listed ? 'usb' : 'wifi');
 	log('transport', transport);
 	// bridge_guard.py starts the same bridge but refuses browser (Origin) and non-local Host requests.
+	// The bridge also requires a per-run secret (passed by env, never written to disk), so other local
+	// users can't reach the phone through port 9333 even though they can't read our token file.
 	const guard = fileURLToPath(new URL('./bridge_guard.py', import.meta.url));
-	const bridge = spawn('uvx', ['--python', '3.12', '--from', PMD3, 'python', guard, 'webinspector', 'cdp', '--port', String(BRIDGE_PORT), ...(transport === 'wifi' ? ['--native'] : [])], { stdio: ['ignore', 'inherit', 'inherit'] });
+	const bridgeSecret = randomBytes(24).toString('hex');
+	const bridgeUrl = (path) => `http://127.0.0.1:${BRIDGE_PORT}${path}?iwi=${bridgeSecret}`;
+	const withSecret = (wsUrl) => wsUrl + (wsUrl.includes('?') ? '&' : '?') + 'iwi=' + bridgeSecret;
+	const bridge = spawn('uvx', ['--python', '3.12', '--from', PMD3, 'python', guard, 'webinspector', 'cdp', '--port', String(BRIDGE_PORT), ...(transport === 'wifi' ? ['--native'] : [])], { stdio: ['ignore', 'inherit', 'inherit'], env: { ...process.env, IWI_BRIDGE_SECRET: bridgeSecret } });
+	// Removes the pid/token files only if they are ours; another daemon may have written them.
+	const releaseState = () => {
+		try {
+			if (readFileSync(PID_FILE, 'utf8').trim() === String(process.pid)) {
+				rmSync(PID_FILE, { force: true });
+				rmSync(TOKEN_FILE, { force: true });
+			}
+		} catch {}
+	};
+	const shutdown = (code = 0) => {
+		bridge.kill();
+		releaseState();
+		process.exit(code);
+	};
 	bridge.on('exit', (code) => {
 		log('bridge exited', code);
+		releaseState();
 		process.exit(1);
 	});
-	const shutdown = () => {
-		bridge.kill();
-		rmSync(PID_FILE, { force: true });
-		rmSync(TOKEN_FILE, { force: true });
-		process.exit(0);
-	};
-	process.on('SIGTERM', shutdown);
-	process.on('SIGINT', shutdown);
+	process.on('SIGTERM', () => shutdown(0));
+	process.on('SIGINT', () => shutdown(0));
+	process.on('uncaughtException', (e) => {
+		log('fatal', e.stack || e.message);
+		shutdown(1);
+	});
+	process.on('unhandledRejection', (e) => log('unhandled rejection', e?.message || e));
 
 	for (let i = 0; ; i++) {
 		try {
-			await fetch(`http://127.0.0.1:${BRIDGE_PORT}/json`);
+			await fetch(bridgeUrl('/json'));
 			break;
 		} catch {
 			if (i > 120) throw new Error('bridge did not start');
@@ -389,9 +470,15 @@ async function runDaemon() {
 
 	const tabs = new Map();
 	let current = null;
+	let lost = null; // the tab being worked on disappeared; don't silently switch to another one
 
-	async function refreshTabs() {
-		const list = await (await fetch(`http://127.0.0.1:${BRIDGE_PORT}/json`)).json();
+	// Concurrent callers share one refresh, so a tab is never connected twice.
+	let refreshing = null;
+	function refreshTabs() {
+		return (refreshing ||= doRefreshTabs().finally(() => (refreshing = null)));
+	}
+	async function doRefreshTabs() {
+		const list = await (await fetch(bridgeUrl('/json'))).json();
 		const pages = list.filter((t) => t.type === 'page' && t.webSocketDebuggerUrl);
 		const seen = new Set();
 		await Promise.all(
@@ -406,16 +493,25 @@ async function runDaemon() {
 				tab = new Tab(info);
 				tabs.set(info.id, tab);
 				try {
-					await tab.connect(info.webSocketDebuggerUrl);
-					await tab.enable();
-					log('attached', info.id, info.url);
+					// Connect only; domains are enabled when the tab becomes the one being worked on.
+					await tab.connect(withSecret(info.webSocketDebuggerUrl));
+					log('attached', info.id, originOf(info.url));
 				} catch (e) {
 					log('attach failed', info.id, e.message);
 				}
 			}),
 		);
-		for (const id of tabs.keys()) if (!seen.has(id)) tabs.delete(id);
-		if (current && !tabs.has(current)) current = null;
+		for (const [id, t] of tabs) {
+			if (seen.has(id)) continue;
+			try {
+				t.ws?.close();
+			} catch {}
+			tabs.delete(id);
+		}
+		if (current && !tabs.has(current)) {
+			lost = current;
+			current = null;
+		}
 	}
 
 	async function tabStates() {
@@ -432,11 +528,20 @@ async function runDaemon() {
 	}
 
 	async function currentTab() {
-		if (current && tabs.get(current)?.ws) return tabs.get(current);
+		if (current) {
+			if (!tabs.get(current)?.ws) await refreshTabs();
+			const t = current && tabs.get(current);
+			if (t?.ws) {
+				await t.enableOnce();
+				return t;
+			}
+		}
+		if (lost) throw new Error(`The tab you were working on (${lost}) closed or disconnected. Run \`tabs\`, then \`use <id>\` to pick one; commands won't switch to another tab on their own.`);
 		const states = await tabStates();
 		const vis = states.find((s) => s.visible);
 		if (!vis) throw new Error('No visible Safari tab. Unlock the iPhone and bring Safari (the tab to inspect) to the front, then retry. If it keeps failing, run `ios.mjs doctor`.');
 		current = vis.id;
+		await tabs.get(current).enableOnce();
 		return tabs.get(current);
 	}
 
@@ -452,16 +557,31 @@ async function runDaemon() {
 		return q.result.nodeId;
 	}
 
+	// A load waiter that is removed again when the caller gives up (timeout or error).
+	function waitLoad(tab) {
+		let fn;
+		const loaded = new Promise((r) => tab.loadWaiters.push((fn = r)));
+		return { loaded, cancel: () => (tab.loadWaiters = tab.loadWaiters.filter((w) => w !== fn)) };
+	}
+
 	// Debugger domain on demand: tracks parsed scripts and the current pause.
 	async function ensureDebugger(tab) {
 		if (tab.debuggerOn) return;
+		if (tab.debuggerStarting) return tab.debuggerStarting;
+		tab.debuggerStarting = startDebugger(tab).finally(() => (tab.debuggerStarting = null));
+		return tab.debuggerStarting;
+	}
+	async function startDebugger(tab) {
 		tab.scripts ||= new Map();
 		tab.on('Debugger.scriptParsed', (p) => tab.scripts.set(p.scriptId, p));
 		tab.on('Debugger.paused', (p) => (tab.pausedAt = p));
 		tab.on('Debugger.resumed', () => (tab.pausedAt = null));
 		tab.on('Debugger.globalObjectCleared', () => { tab.scripts.clear(); tab.pausedAt = null; });
 		const r = await tab.send('Debugger.enable');
-		if (r.error) throw new Error(r.error.message);
+		if (r.error) {
+			for (const m of ['Debugger.scriptParsed', 'Debugger.paused', 'Debugger.resumed', 'Debugger.globalObjectCleared']) tab.listeners.delete(m);
+			throw new Error(r.error.message);
+		}
 		tab.debuggerOn = true;
 		await sleep(300); // scriptParsed for already-loaded scripts arrives right after enable
 	}
@@ -477,22 +597,29 @@ async function runDaemon() {
 		async use({ match, reset }) {
 			if (reset) {
 				current = null;
+				lost = null;
 				return null;
 			}
 			const states = await tabStates();
 			const hit = states.find((s) => s.id === match) || (/^\d+$/.test(match) && states.find((s) => s.id.endsWith(':' + match))) || states.find((s) => s.url.includes(match));
 			if (!hit) throw new Error(`no tab matches "${match}"`);
 			current = hit.id;
+			lost = null;
+			await tabs.get(current).enableOnce();
 			return hit;
 		},
 		async open({ url, timeout = 30000 }) {
 			const tab = await currentTab();
 			tab.logs = [];
 			tab.requests.clear();
-			const loaded = new Promise((r) => tab.loadWaiters.push(r));
+			const { loaded, cancel } = waitLoad(tab);
 			const r = await tab.send('Page.navigate', { url });
-			if (r.error) throw new Error(r.error.message);
+			if (r.error) {
+				cancel();
+				throw new Error(r.error.message);
+			}
 			const ok = await Promise.race([loaded.then(() => true), sleep(timeout).then(() => false)]);
+			cancel();
 			await sleep(800); // let trailing responses land so `net` right after shows statuses
 			const info = await tab.evaluate('({url: location.href, title: document.title})');
 			return { ...info, loaded: ok };
@@ -501,16 +628,25 @@ async function runDaemon() {
 			const tab = await currentTab();
 			tab.logs = [];
 			tab.requests.clear();
-			const loaded = new Promise((r) => tab.loadWaiters.push(r));
+			const { loaded, cancel } = waitLoad(tab);
 			await tab.send('Page.reload', {});
 			const ok = await Promise.race([loaded.then(() => true), sleep(timeout).then(() => false)]);
+			cancel();
 			return { url: tab.url, loaded: ok };
 		},
 		async eval({ js, gesture }) {
 			const tab = await currentTab();
 			// A bare expression is returned as-is; statements need an explicit `return`.
-			const statements = /^\s*(return|const|let|var|if|for|while|await|try)\b|;\s*\S/.test(js);
-			const body = statements ? js : `return (${js});`;
+			// Decided by parsing, so a `;` inside a string doesn't turn an expression into statements.
+			let expression = !/^\s*(return|const|let|var|if|for|while|try|throw|class|function)\b/.test(js);
+			if (expression) {
+				try {
+					new AsyncFunction(`return (${js}\n);`);
+				} catch {
+					expression = false;
+				}
+			}
+			const body = expression ? `return (${js}\n);` : js;
 			if (/\bawait\b/.test(js)) return tab.evaluateAsync(body, 30000, gesture);
 			return tab.evaluate(`(() => { ${body} })()`, 20000, gesture);
 		},
@@ -537,15 +673,16 @@ async function runDaemon() {
 		},
 		async traceStop({ path }) {
 			const tab = await currentTab();
+			let off;
 			const done = new Promise((res) => {
-				const off = tab.on('Tracing.tracingComplete', () => {
-					off();
-					res(true);
-				});
+				off = tab.on('Tracing.tracingComplete', () => res(true));
 				setTimeout(() => res(false), 60000);
-			});
+			}).finally(() => off());
 			const r = await tab.send('Tracing.end');
-			if (r.error) throw new Error(r.error.message);
+			if (r.error) {
+				off();
+				throw new Error(r.error.message);
+			}
 			const complete = await done;
 			tab.offTrace?.();
 			const events = tab.traceChunks || [];
@@ -621,14 +758,11 @@ async function runDaemon() {
 			if (r.error) throw new Error(r.error.message);
 			return { scripts: tab.injected.length, appliesFrom: 'next navigation/reload' };
 		},
-		async listeners({ selector }) {
+		async listeners({ target }) {
 			const tab = await currentTab();
 			// The bridge can't translate DOMDebugger.getEventListeners; WebKit's own DOM.getEventListenersForNode
 			// works and also returns listeners on ancestors that the event would bubble through.
-			const doc = await tab.send('DOM.getDocument', { depth: 0 });
-			const q = await tab.send('DOM.querySelector', { nodeId: doc.result?.root?.nodeId, selector });
-			const nodeId = q.result?.nodeId;
-			if (!nodeId) throw new Error(`no element ${selector}`);
+			const nodeId = await nodeFor(tab, target);
 			const r = await tab.send('DOM.getEventListenersForNode', { nodeId });
 			if (r.error) throw new Error(r.error.message);
 			const names = new Map();
@@ -659,8 +793,15 @@ async function runDaemon() {
 				const c = tab.cast;
 				if (!c) return;
 				const ms = Date.now() - c.t0;
-				writeFileSync(join(c.dir, `${String(c.n++).padStart(4, '0')}-${ms}ms.jpg`), Buffer.from(p.data, 'base64'));
-				tab.send('Page.screencastFrameAck', { sessionId: p.sessionId });
+				try {
+					writeFileSync(join(c.dir, `${String(c.n++).padStart(4, '0')}-${ms}ms.jpg`), Buffer.from(p.data, 'base64'));
+				} catch (e) {
+					c.error = e.message;
+					tab.cast = null;
+					tab.send('Page.stopScreencast').catch(() => {});
+					return;
+				}
+				tab.send('Page.screencastFrameAck', { sessionId: p.sessionId }).catch(() => {});
 			});
 			const r = await tab.send('Page.startScreencast', { format: 'jpeg', quality, maxWidth: 1179, maxHeight: 2556, everyNthFrame });
 			if (r.error) throw new Error(r.error.message);
@@ -713,6 +854,7 @@ async function runDaemon() {
 		async usageStart() {
 			const tab = await currentTab();
 			tab.trace = [];
+			tab.traceRequests = 0;
 			const res = {};
 			// The bridge forwards CPU and memory sampling (every ~500ms) but not Timeline/ScriptProfiler events.
 			for (const m of ['CPUProfiler.startTracking', 'Memory.startTracking']) {
@@ -738,7 +880,7 @@ async function runDaemon() {
 				return { t: Math.round((c.timestamp - t0) * 10) / 10, cpu: Math.round(c.usage), main: Math.round(c.threads?.find((th) => th.type === 'main')?.usage ?? 0), memMB: Math.round(Object.values(cats).reduce((a, b) => a + b, 0)), ...cats };
 			});
 			const peak = (k) => samples.reduce((a, s) => (s[k] > (a?.[k] ?? -1) ? s : a), null);
-			return { path, samples, peakCpu: peak('cpu'), peakMain: peak('main'), peakMem: peak('memMB'), requests: events.filter((e) => e.method === 'Network.requestWillBeSent').length };
+			return { path, samples, peakCpu: peak('cpu'), peakMain: peak('main'), peakMem: peak('memMB'), requests: tab.traceRequests || 0 };
 		},
 		// ---- Elements
 		async snapshot({ all }) {
@@ -818,7 +960,7 @@ async function runDaemon() {
 				if (l.nodeId) {
 					const d = await tab.send('DOM.describeNode', { nodeId: l.nodeId });
 					const n = d.result?.node;
-					if (n) node = (n.localName || n.nodeName) + (n.attributes ? (() => { const a = n.attributes; const id = a[a.indexOf('id') + 1]; const cl = a[a.indexOf('class') + 1]; return (a.includes('id') ? '#' + id : '') + (a.includes('class') ? '.' + String(cl).split(' ')[0] : ''); })() : '');
+					if (n) node = (n.localName || n.nodeName) + (n.attributes ? (() => { const a = n.attributes; let id, cl; for (let i = 0; i < a.length; i += 2) { if (a[i] === 'id') id = a[i + 1]; if (a[i] === 'class') cl = a[i + 1]; } return (id ? '#' + id : '') + (cl ? '.' + String(cl).split(' ')[0] : ''); })() : '');
 				}
 				out.push({ layerId: l.layerId, node: node || (l.isGeneratedContent ? 'pseudo' : l.isAnonymous ? 'anonymous' : ''), size: `${Math.round(l.bounds.width)}×${Math.round(l.bounds.height)}`, memoryKB: Math.round((l.memory || 0) / 1024), paints: l.paintCount, reasons });
 			}
@@ -835,7 +977,7 @@ async function runDaemon() {
 				for (const c of list.filter((c) => clear === true || c.name === clear)) await tab.send('Page.deleteCookie', { cookieName: c.name, url: tab.url });
 				return { deleted: list.filter((c) => clear === true || c.name === clear).map((c) => c.name) };
 			}
-			return list.map((c) => ({ name: c.name, value: values ? (c.value.length > 60 ? c.value.slice(0, 60) + '…' : c.value) : `<${c.value.length} chars, --values to show>`, domain: c.domain, path: c.path, expires: c.session ? 'session' : new Date(c.expires).toISOString().slice(0, 10), httpOnly: c.httpOnly, secure: c.secure, sameSite: c.sameSite }));
+			return list.map((c) => ({ name: c.name, value: values ? (c.value.length > 60 ? c.value.slice(0, 60) + '…' : c.value) : `<${c.value.length} chars, --values to show>`, domain: c.domain, path: c.path, expires: c.session || !(c.expires > 0) ? 'session' : new Date(c.expires < 1e11 ? c.expires * 1000 : c.expires).toISOString().slice(0, 10), httpOnly: c.httpOnly, secure: c.secure, sameSite: c.sameSite }));
 		},
 		async storage({ kind = 'local', clear }) {
 			const tab = await currentTab();
@@ -927,6 +1069,7 @@ async function runDaemon() {
 		},
 		async step({ how }) {
 			const tab = await currentTab();
+			await ensureDebugger(tab);
 			const method = { over: 'Debugger.stepOver', into: 'Debugger.stepInto', out: 'Debugger.stepOut', resume: 'Debugger.resume', pause: 'Debugger.pause' }[how];
 			if (!method) throw new Error('step over|into|out, resume, pause');
 			const wasPaused = !!tab.pausedAt;
@@ -974,19 +1117,19 @@ async function runDaemon() {
 			const entries = [...tab.requests.values()].map((r) => ({
 				startedDateTime: new Date(r.t).toISOString(),
 				time: r.ms ?? 0,
-				request: { method: r.method, url: r.url, httpVersion: 'HTTP/2', headers: Object.entries(r.reqHeaders || {}).map(([name, value]) => ({ name, value: String(value) })), queryString: [...new URL(r.url).searchParams].map(([name, value]) => ({ name, value })), cookies: [], headersSize: -1, bodySize: r.postData ? r.postData.length : 0, ...(r.postData && { postData: { mimeType: (r.reqHeaders || {})['Content-Type'] || '', text: r.postData } }) },
-				response: { status: r.status ?? 0, statusText: r.failed || '', httpVersion: 'HTTP/2', headers: Object.entries(r.headers || {}).map(([name, value]) => ({ name, value: String(value) })), cookies: [], content: { size: r.bytes ?? 0, mimeType: r.mime || '' }, redirectURL: '', headersSize: -1, bodySize: r.bytes ?? -1 },
+				request: { method: r.method, url: r.url, httpVersion: r.protocol || 'unknown', headers: Object.entries(r.reqHeaders || {}).map(([name, value]) => ({ name, value: String(value) })), queryString: [...new URL(r.url).searchParams].map(([name, value]) => ({ name, value })), cookies: [], headersSize: -1, bodySize: r.postData ? r.postData.length : 0, ...(r.postData && { postData: { mimeType: (r.reqHeaders || {})['Content-Type'] || '', text: r.postData } }) },
+				response: { status: r.status ?? 0, statusText: r.failed || '', httpVersion: r.protocol || 'unknown', headers: Object.entries(r.headers || {}).map(([name, value]) => ({ name, value: String(value) })), cookies: [], content: { size: r.bytes ?? 0, mimeType: r.mime || '' }, redirectURL: '', headersSize: -1, bodySize: r.bytes ?? -1 },
 				cache: {},
 				timings: { send: 0, wait: r.ms ?? 0, receive: 0 },
 				_resourceType: r.type,
 			}));
-			return { log: { version: '1.2', creator: { name: 'iphone-webkit-inspector', version: '0.2.0' }, pages: [{ startedDateTime: entries[0]?.startedDateTime || new Date().toISOString(), id: 'page_1', title: tab.url, pageTimings: {} }], entries } };
+			return { log: { version: '1.2', creator: { name: 'iphone-webkit-inspector', version: PLUGIN_VERSION, comment: 'partial: redirect hops and per-phase timings are not captured; all time is under wait' }, pages: [{ startedDateTime: entries[0]?.startedDateTime || new Date().toISOString(), id: 'page_1', title: tab.url, pageTimings: {} }], entries } };
 		},
 		async websockets() {
 			const tab = await currentTab();
 			return tab.events
 				.filter((e) => /^Network\.webSocket/.test(e.method))
-				.map((e) => ({ t: new Date(e.t).toISOString().slice(11, 23), event: e.method.replace('Network.webSocket', ''), url: e.params.url, data: e.params.response?.payloadData?.slice(0, 200), opcode: e.params.response?.opcode }));
+				.map((e) => ({ t: new Date(e.t).toISOString().slice(11, 23), event: e.method.replace('Network.webSocket', ''), url: e.params.url, data: (e.params.response || e.params.request)?.payloadData?.slice(0, 200), opcode: (e.params.response || e.params.request)?.opcode }));
 		},
 
 		async perf() {
@@ -1008,29 +1151,46 @@ async function runDaemon() {
 	// the token header without a CORS preflight, which is never answered), and so are Hosts other
 	// than 127.0.0.1 (DNS rebinding).
 	const token = randomBytes(24).toString('hex');
-	writeFileSync(TOKEN_FILE, token, { mode: 0o600 });
-	createServer(async (req, res) => {
-		const host = String(req.headers.host || '').replace(/:\d+$/, '');
-		if (req.headers.origin || req.headers['x-iwi-token'] !== token || !['127.0.0.1', 'localhost'].includes(host) || req.method !== 'POST') {
-			res.writeHead(403).end();
-			req.resume();
-			return;
-		}
-		let body = '';
-		for await (const c of req) body += c;
-		const cmd = req.url.slice(1);
-		const fn = handlers[cmd];
-		let out;
+	const server = createServer(async (req, res) => {
 		try {
-			if (!fn) throw new Error(`unknown command ${cmd}`);
-			out = { ok: true, result: await fn(body ? JSON.parse(body) : {}) };
+			const host = String(req.headers.host || '').replace(/:\d+$/, '');
+			if (req.headers.origin || req.headers['x-iwi-token'] !== token || !['127.0.0.1', 'localhost'].includes(host) || req.method !== 'POST') {
+				res.writeHead(403).end();
+				req.resume();
+				return;
+			}
+			let body = '';
+			for await (const c of req) {
+				body += c;
+				if (body.length > 20e6) throw new Error('request too large');
+			}
+			const cmd = req.url.slice(1);
+			const fn = handlers[cmd];
+			let out;
+			try {
+				if (!fn) throw new Error(`unknown command ${cmd}`);
+				out = { ok: true, result: await fn(body ? JSON.parse(body) : {}) };
+			} catch (e) {
+				out = { ok: false, error: e.message };
+			}
+			res.setHeader('content-type', 'application/json');
+			res.end(JSON.stringify(out));
 		} catch (e) {
-			out = { ok: false, error: e.message };
+			log('request failed', e.message);
+			if (!res.headersSent) res.writeHead(400);
+			res.end();
 		}
-		res.setHeader('content-type', 'application/json');
-		res.end(JSON.stringify(out));
-	}).listen(DAEMON_PORT, '127.0.0.1', () => {
-		writeFileSync(PID_FILE, String(process.pid));
+	});
+	server.on('error', (e) => {
+		// Port taken (another daemon won the race): leave its pid/token alone and exit.
+		log('daemon could not listen', e.message);
+		bridge.kill();
+		process.exit(1);
+	});
+	server.listen(DAEMON_PORT, '127.0.0.1', () => {
+		// Published only after binding, so a daemon that loses the port never overwrites the winner's token.
+		writeFileSync(TOKEN_FILE, token, { mode: 0o600 });
+		writeFileSync(PID_FILE, String(process.pid), { mode: 0o600 });
 		log('daemon ready on', DAEMON_PORT);
 	});
 
@@ -1065,15 +1225,35 @@ async function ensureDaemon() {
 	// Something answers on the daemon port but refuses us: a daemon from another install or a stale token.
 	const probe = await fetch(`http://127.0.0.1:${DAEMON_PORT}/status`, { method: 'POST' }).catch(() => null);
 	if (probe) throw new Error(`port ${DAEMON_PORT} is in use by a daemon that refuses this client; stop it (pkill -f "ios.mjs __daemon") and retry`);
-	mkdirSync(STATE_DIR, { recursive: true });
-	const out = openSync(LOG_FILE, 'a');
-	const child = spawn(process.execPath, [fileURLToPath(import.meta.url), '__daemon'], { detached: true, stdio: ['ignore', out, out] });
-	child.unref();
+	ensureStateDir();
+	// One starter at a time; a lock older than 2 minutes is from a crashed start and is taken over.
+	let starter = false;
+	try {
+		openSync(LOCK_FILE, 'wx');
+		starter = true;
+	} catch {
+		try {
+			if (Date.now() - statSync(LOCK_FILE).mtimeMs > 120000) {
+				writeFileSync(LOCK_FILE, '');
+				starter = true;
+			}
+		} catch {}
+	}
+	if (starter) {
+		const out = openSync(LOG_FILE, 'a', 0o600);
+		try {
+			chmodSync(LOG_FILE, 0o600);
+		} catch {}
+		const child = spawn(process.execPath, [fileURLToPath(import.meta.url), '__daemon'], { detached: true, stdio: ['ignore', out, out] });
+		child.unref();
+	}
+	const unlock = () => starter && rmSync(LOCK_FILE, { force: true });
 	process.stderr.write('starting iPhone bridge');
 	for (let i = 0; i < 180; i++) {
 		await sleep(500);
 		if (await daemonUp()) {
 			process.stderr.write(' ok\n');
+			unlock();
 			return;
 		}
 		if (i % 4 === 0) process.stderr.write('.');
@@ -1110,6 +1290,7 @@ async function doctor(skipChrome) {
 	const ok = (m) => console.log(`✓ ${m}`);
 	const bad = (m, fix) => {
 		failed = true;
+		process.exitCode = 1;
 		console.log(`✗ ${m}\n    → ${fix}`);
 	};
 
@@ -1189,12 +1370,22 @@ async function report({ title, what }) {
 	} catch {}
 	const names = devices.map((d) => d.deviceProperties?.name).filter(Boolean);
 	const redact = (t) => {
-		let out = String(t).replaceAll(homedir(), '~').replace(/\b[0-9A-F]{8}-[0-9A-F]{16}\b/gi, '<udid>').replace(/\b[0-9a-f]{40}\b/gi, '<udid>');
+		// URLs go first, so a later name substitution can't cut a URL short and leave its path behind.
+		// Pages the user visited stay private: keep only the scheme.
+		let out = String(t)
+			.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>)]+/gi, (u) => {
+				try {
+					const p = new URL(u);
+					if (['127.0.0.1', 'localhost'].includes(p.hostname)) return `${p.protocol}//${p.host}/<path>`;
+				} catch {}
+				return u.split('://')[0] + '://<url>';
+			})
+			.replace(/\b(data|blob|javascript|about):[^\s"'<>)]+/gi, '$1:<redacted>')
+			.replace(/PID%3A\d+%3A\d+|PID:\d+:\d+/g, '<tab>');
+		out = out.replaceAll(homedir(), '~').replace(/\b[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/gi, '<udid>').replace(/\b[0-9A-F]{8}-[0-9A-F]{16}\b/gi, '<udid>').replace(/\b[0-9a-f]{40}\b/gi, '<udid>');
 		for (const n of names) out = out.replaceAll(n, '<device>');
 		const host = hostname().split('.')[0];
-		if (host) out = out.replaceAll(host, '<mac>');
-		// Pages the user visited stay private: keep only the scheme.
-		out = out.replace(/\bhttps?:\/\/[^\s"'<>)]+/g, (u) => (u.startsWith('http://127.0.0.1') ? u : u.split('://')[0] + '://<url>')).replace(/PID%3A\d+%3A\d+|PID:\d+:\d+/g, '<tab>');
+		if (host && host.length > 3) out = out.replaceAll(host, '<mac>');
 		return out;
 	};
 	const env = [
@@ -1210,7 +1401,7 @@ async function report({ title, what }) {
 	const body = redact(`### What happened\n\n${what || '<!-- what you ran and what went wrong -->'}\n\n### Environment\n\n\`\`\`\n${env}\n\`\`\`\n\n### doctor\n\n\`\`\`\n${doc}\n\`\`\`\n\n### Daemon log (last 60 lines)\n\n\`\`\`\n${log || '(empty)'}\n\`\`\`\n`);
 	const file = join(tmpdir(), `iphone-webkit-inspector-report-${Date.now()}.md`);
 	writeFileSync(file, body);
-	const t = title || 'Bug: ';
+	const t = redact(title || 'Bug: ');
 	const short = body.length > 6000 ? body.slice(0, 6000) + '\n…(truncated, full report in the file)' : body;
 	console.log(`report saved: ${file}\n`);
 	console.log(`open to file an issue (review it first):\nhttps://github.com/${REPO}/issues/new?labels=bug&title=${encodeURIComponent(t)}&body=${encodeURIComponent(short)}`);
@@ -1267,7 +1458,7 @@ Element targets (<el>): CSS selector | text=<label> | @e12 (from snapshot) | x y
   open <url> | reload | close  navigate (waits for load, clears logs/net) | reload | close tab
   snapshot [--all]             elements you can act on, as @eN refs
   eval <js> [--gesture]        run JS; expression, or statements with return/await
-  tap <el>                     touch + click, run as a user gesture
+  tap <el>                     touch + click as a user gesture; refuses if covered; "x y" = exact point
   type <el> <text>             set an input's value and fire input/change
   shot [path] [--device]       screenshot of the page; --device = whole screen incl. Safari's bars and keyboard
   record start [dir] | record stop      screen recording as JPEG frames named <n>-<ms>ms.jpg
@@ -1286,7 +1477,7 @@ Element targets (<el>): CSS selector | text=<label> | @e12 (from snapshot) | x y
   net [url-part] [--failed]    requests: id status type size time url
   req <id|url-part>            request + response headers, post data
   body <id|url-part> [--out f] response body
-  har [out.har]                export recorded requests as HAR
+  har [out.har]                export recorded requests as HAR (no redirect hops or per-phase timings)
   ws                           WebSocket frames
   block <url-part>             fail matching requests
   mock <url-part> <status> <body|@file> [--type ct]   answer matching requests yourself
@@ -1331,12 +1522,17 @@ async function main() {
 	if (cmd === '__daemon') return runDaemon();
 	if (!cmd || cmd === 'help' || cmd === '-h') return console.log(HELP);
 
-	const flags = new Set(rest.filter((a) => a.startsWith('--')));
+	// Everything after a bare `--` is positional, so text like `--example` can be typed or mocked.
+	const dd = rest.indexOf('--');
+	// --flag=value is the same as --flag value.
+	const opts = (dd >= 0 ? rest.slice(0, dd) : rest).flatMap((a) => (/^--[a-z-]+=/.test(a) ? [a.slice(0, a.indexOf('=')), a.slice(a.indexOf('=') + 1)] : [a]));
+	const tail = dd >= 0 ? rest.slice(dd + 1) : [];
+	const flags = new Set(opts.filter((a) => a.startsWith('--')));
 	const valueFlags = new Set(['--out', '--type', '--last', '--computed', '--line', '--if', '--title', '--what']);
-	const pos = rest.filter((a, i) => !a.startsWith('--') && !valueFlags.has(rest[i - 1]));
+	const pos = [...opts.filter((a, i) => !a.startsWith('--') && !valueFlags.has(opts[i - 1])), ...tail];
 	const flagVal = (name) => {
-		const i = rest.indexOf(name);
-		return i >= 0 ? rest[i + 1] : undefined;
+		const i = opts.indexOf(name);
+		return i >= 0 ? opts[i + 1] : undefined;
 	};
 
 	if (cmd === 'doctor') return doctor(flags.has('--no-chrome'));
@@ -1345,6 +1541,7 @@ async function main() {
 	if (cmd === 'launch') {
 		// Opens an app on the phone via Xcode's devicectl. --restart is needed after toggling Chrome's Web Inspector.
 		const apps = { safari: 'com.apple.mobilesafari', chrome: 'com.google.chrome.ios' };
+		if (/^[a-z]+:\/\//i.test(pos[0] || '')) pos.unshift('safari'); // `launch <url>` means Safari
 		const bundle = apps[pos[0]] || pos[0] || apps.safari;
 		const udid = await connectedUdid();
 		const args = ['devicectl', 'device', 'process', 'launch', '--device', udid];
@@ -1362,7 +1559,10 @@ async function main() {
 		if (await daemonUp()) await call('stop').catch(() => {});
 		else if (existsSync(PID_FILE)) {
 			try {
-				process.kill(Number(readFileSync(PID_FILE, 'utf8')));
+				const pid = Number(readFileSync(PID_FILE, 'utf8'));
+				const cmdline = (await run('ps', ['-p', String(pid), '-o', 'command='])).out;
+				if (cmdline.includes('ios.mjs') && cmdline.includes('__daemon')) process.kill(pid);
+				rmSync(PID_FILE, { force: true });
 			} catch {}
 		}
 		return console.log('stopped');
@@ -1555,13 +1755,18 @@ async function main() {
 		}
 		case 'tap': {
 			// Synthetic touch → pointer → mouse → click sequence at the element's center (or at x,y).
-			const target = targetJs(pos.join(' '));
+			// Element targets tap the center and refuse if something else covers it; `x y` taps that exact point.
+			const label = JSON.stringify(pos.join(' '));
+			const xy = pos.length === 2 && pos.every((a) => /^-?\d+(\.\d+)?$/.test(a)) ? pos.map(Number) : null;
+			const target = xy ? 'null' : targetJs(pos.join(' '));
 			const js = `
-				const el = ${target};
-				if (!el) throw new Error('no element for ${pos.join(' ').replace(/'/g, '')}');
-				el.scrollIntoView({ block: 'center' });
-				const r = el.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2;
-				const hit = document.elementFromPoint(x, y) || el;
+				const at = ${JSON.stringify(xy)};
+				const el = at ? document.elementFromPoint(at[0], at[1]) : ${target};
+				if (!el) throw new Error('no element for ' + ${label});
+				if (!at) el.scrollIntoView({ block: 'center' });
+				const r = el.getBoundingClientRect(), x = at ? at[0] : r.left + r.width / 2, y = at ? at[1] : r.top + r.height / 2;
+				const hit = at ? el : document.elementFromPoint(x, y) || el;
+				if (hit !== el && !el.contains(hit)) return { tapped: false, covered: true, by: hit.tagName.toLowerCase() + (hit.id ? '#' + hit.id : '') + (typeof hit.className === 'string' && hit.className ? '.' + hit.className.trim().split(/\\s+/)[0] : ''), note: 'something covers the element; take a new snapshot' };
 				const opt = { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, view: window };
 				let touch = null;
 				try { touch = new Touch({ identifier: Date.now(), target: hit, clientX: x, clientY: y }); } catch {}
@@ -1571,7 +1776,7 @@ async function main() {
 				fire('pointerup', PointerEvent, { pointerType: 'touch', isPrimary: true });
 				const go = touch ? fire('touchend', TouchEvent, { touches: [], targetTouches: [], changedTouches: [touch] }) : true;
 				if (go) { fire('mousedown', MouseEvent); fire('mouseup', MouseEvent); hit.click(); }
-				return { tapped: hit.tagName.toLowerCase() + (hit.id ? '#' + hit.id : ''), text: (hit.innerText || hit.value || '').trim().slice(0, 60), x: Math.round(x), y: Math.round(y), covered: hit !== el && !el.contains(hit) };`;
+				return { tapped: hit.tagName.toLowerCase() + (hit.id ? '#' + hit.id : ''), text: (hit.innerText || hit.value || '').trim().slice(0, 60), x: Math.round(x), y: Math.round(y) };`;
 			return console.log(await call('eval', { js, gesture: true }));
 		}
 		case 'close': {
@@ -1587,13 +1792,17 @@ async function main() {
 			const [sel, ...words] = pos;
 			const js = `
 				const el = ${targetJs(sel)};
-				if (!el) throw new Error('no element ${sel.replace(/'/g, '')}');
+				if (!el) throw new Error('no element ' + ${JSON.stringify(String(sel))});
 				el.focus();
-				const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-				Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, ${JSON.stringify(words.join(' '))});
+				const text = ${JSON.stringify(words.join(' '))};
+				if (el.isContentEditable) el.textContent = text;
+				else {
+					const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : el instanceof HTMLSelectElement ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
+					Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, text);
+				}
 				el.dispatchEvent(new InputEvent('input', { bubbles: true, data: ${JSON.stringify(words.join(' '))}, inputType: 'insertText' }));
 				el.dispatchEvent(new Event('change', { bubbles: true }));
-				return el.value;`;
+				return el.isContentEditable ? el.textContent : el.value;`;
 			return console.log(await call('eval', { js, gesture: true }));
 		}
 		case 'fps': {
@@ -1623,12 +1832,12 @@ async function main() {
 			if (pos[0] !== 'stop') return console.log('usage: trace start [--screenshots] | trace stop [out.json]');
 			const r = await call('traceStop', { path: resolve(pos[1] || join(tmpdir(), `iphone-trace-${Date.now()}.json`)) });
 			console.log(`${r.events} events over ${r.spanMs}ms${r.complete ? '' : ' (bridge never sent tracingComplete; data may be partial)'}`);
-			if (Object.keys(r.marks).length) console.log('marks  ' + Object.entries(r.marks).map(([k, v]) => `${k} ${v}ms`).join('  '));
-			console.log('\nmain-thread time by event:');
-			for (const t of r.top) console.log(`  ${String(t.ms).padStart(6)}ms ${String(t.count).padStart(5)}×  ${t.name}`);
-			if (r.long.length) {
-				console.log('\nlong tasks (≥50ms):');
-				for (const l of r.long) console.log(`  @${String(l.at).padStart(7)}ms ${String(l.ms).padStart(5)}ms  ${l.name}  ${trunc(l.detail, 90)}`);
+			if (Object.keys(r.marksFromTraceStart).length) console.log('marks (from trace start)  ' + Object.entries(r.marksFromTraceStart).map(([k, v]) => `${k} ${v}ms`).join('  '));
+			console.log('\ntime by event (inclusive, all threads; nested events overlap):');
+			for (const t of r.inclusiveMsByEvent) console.log(`  ${String(t.ms).padStart(6)}ms ${String(t.count).padStart(5)}×  ${t.name}`);
+			if (r.longEvents.length) {
+				console.log('\nlong events (≥50ms, may be nested inside each other):');
+				for (const l of r.longEvents) console.log(`  @${String(l.at).padStart(7)}ms ${String(l.ms).padStart(5)}ms  ${l.name}  ${trunc(l.detail, 90)}`);
 			}
 			console.log(`\nfull trace → ${r.path}  (open in Chrome DevTools → Performance → Load profile, or ui.perfetto.dev)`);
 			return;
@@ -1652,7 +1861,7 @@ async function main() {
 		case 'mock': {
 			// mock <url-part> <status> <body | @file> [--type content/type]
 			const typeArg = flagVal('--type');
-			let body = pos.slice(2).filter((a) => a !== typeArg).join(' ');
+			let body = pos.slice(2).join(' ');
 			if (body.startsWith('@')) body = readFileSync(body.slice(1), 'utf8');
 			const contentType = typeArg || (body.trim().startsWith('<') ? 'text/html' : 'application/json');
 			return console.log(await call('intercept', { action: 'mock', match: pos[0], status: pos[1] || 200, body, contentType }));
@@ -1669,7 +1878,7 @@ async function main() {
 			if (flags.has('--clear')) return console.log(await call('inject', { clear: true }));
 			return console.log(await call('inject', { source: pos[0]?.startsWith('@') ? readFileSync(pos[0].slice(1), 'utf8') : pos.join(' ') }));
 		case 'listeners': {
-			const list = await call('listeners', { selector: pos.join(' ') });
+			const list = await call('listeners', { target: targetJs(pos.join(' ')) });
 			for (const l of list) console.log(`${l.type.padEnd(14)} on ${String(l.on).padEnd(8)} ${l.capture ? 'capture ' : ''}${l.passive ? 'passive ' : ''}${l.once ? 'once ' : ''}${l.attr ? 'attribute ' : ''} ${l.where || ''}`);
 			if (!list.length) console.log('(no listeners)');
 			return;
@@ -1691,6 +1900,7 @@ async function main() {
 				const r = await call('usageStop', { path: resolve(pos[1] || join(tmpdir(), `iphone-usage-${Date.now()}.json`)) });
 				console.log(`${'t(s)'.padStart(5)} ${'cpu%'.padStart(5)} ${'main%'.padStart(5)} ${'memMB'.padStart(6)}  js / jit / images / layers / page / other (MB)`);
 				for (const s of r.samples) console.log(`${String(s.t).padStart(5)} ${String(s.cpu).padStart(5)} ${String(s.main).padStart(5)} ${String(s.memMB).padStart(6)}  ${[s.javascript, s.jit, s.images, s.layers, s.page, s.other].join(' / ')}`);
+				if (!r.samples.length) return console.log(`no CPU/memory samples arrived; raw events → ${r.path}`);
 				console.log(`peak cpu ${r.peakCpu?.cpu}% @${r.peakCpu?.t}s, main thread ${r.peakMain?.main}% @${r.peakMain?.t}s, memory ${r.peakMem?.memMB}MB @${r.peakMem?.t}s; ${r.requests} requests; raw events → ${r.path}`);
 				return;
 			}

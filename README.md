@@ -57,7 +57,8 @@ and it can't attach to a real iPhone. This plugin works on Safari or Chrome runn
 | Service workers, Cache Storage | ✅ | ⚠️ | ❌ |
 | **Performance** | | | |
 | Navigation and resource timings | ✅ | ⚠️ via JS | ✅ `perf` |
-| FCP, CLS | ✅ | ⚠️ via JS | ✅ |
+| FCP | ✅ | ⚠️ via JS | ✅ |
+| CLS | ✅ | ⚠️ via JS | ❌ Safari doesn't support layout-shift |
 | LCP | ✅ | ⚠️ | ❌ Safari 18 doesn't report it |
 | Performance trace | ✅ | ⚠️ Chromium only | ✅ Chrome-format, opens in DevTools |
 | JS CPU profile | ✅ | ⚠️ Chromium only | ⚠️ sample shares, no exact ms |
@@ -77,7 +78,7 @@ and it can't attach to a real iPhone. This plugin works on Safari or Chrome runn
 | Test runner and assertions | ❌ | ✅ | ❌ |
 
 In short, most of what you'd open DevTools for works on the real phone. You don't get OS-level input (native UI,
-the keyboard), throttling, Lighthouse or LCP.
+the keyboard), throttling, Lighthouse, LCP or CLS.
 
 ## Commands
 
@@ -88,10 +89,10 @@ Element targets (`<el>`): a CSS selector, `text=<label>`, `@e12` from `snapshot`
 | Setup | `doctor`, `launch safari\|chrome [url]`, `status`, `stop`, `report` |
 | Pages | `tabs`, `use`, `open`, `reload`, `close`, `snapshot`, `eval`, `tap`, `type`, `shot`, `record` |
 | Elements | `dom`, `styles`, `a11y`, `highlight`, `pseudo`, `listeners`, `layers` |
-| Console and network | `logs`, `net`, `req`, `body`, `har`, `ws`, `block`, `mock`, `unmock`, `nocache`, `events` |
+| Console and network | `logs`, `net`, `req`, `body`, `har`, `ws`, `block`, `mock`, `mocks`, `unmock`, `nocache`, `events` |
 | Sources | `scripts`, `source`, `break`, `pause-on`, `pause`, `paused`, `step`, `frame-eval`, `resume` |
 | Application | `cookies`, `storage`, `idb` |
-| Performance | `perf`, `trace`, `profile`, `usage`, `heap` |
+| Performance | `perf`, `trace`, `profile`, `usage`, `heap`, `fps` |
 | Rendering | `media`, `paintflash`, `ua`, `js`, `inject` |
 | Anything else | `cdp <Method> <json>` |
 
@@ -136,7 +137,10 @@ To check your setup, ask Claude to run `doctor`.
   PyPI, and a uv-managed Python 3.12 if you don't have one.
 - `bridge_guard.py` wraps the bridge and refuses requests from web pages (anything with an `Origin` header) and
   requests with a Host other than `127.0.0.1`/`localhost`, so a site open on your Mac can't reach your phone through
-  it. The daemon also requires a random per-run token stored in `~/.cache/iphone-webkit-inspector/token` (mode 600).
+  it. It also requires a random per-run secret that the daemon passes to it in an environment variable, so other
+  users on the same Mac can't use it either. The daemon requires its own random per-run token, stored in
+  `~/.cache/iphone-webkit-inspector/token` (mode 600). Other processes running as you can read that token, the
+  same as with any local developer tool.
 - `xcrun devicectl` lists the iPhone and launches Safari or Chrome on it.
 - The bridge reaches the iPhone through macOS's `usbmuxd` over USB, or over Wi-Fi through the CoreDevice
   tunnel macOS already keeps up for Xcode (`--native`). Either way the traffic stays between your Mac and your phone.
@@ -152,10 +156,16 @@ To check your setup, ask Claude to run `doctor`.
 Everything the commands return goes into your Claude Code session, and from there to the model provider like any
 other tool output. That includes what you ask for from the phone: page text and HTML, console messages, request and
 response headers and bodies, localStorage, sessionStorage and IndexedDB contents, and cookie names (cookie values
-only with `cookies --values`). Only point it at tabs you're fine sharing that way, and keep private tabs (mail,
-banking) closed or in the background while you use it.
+only with `cookies --values`). `snapshot` never shows what's typed into password fields. Only point it at tabs
+you're fine sharing that way.
 
-Nothing is stored except the daemon's state in `~/.cache/iphone-webkit-inspector/` and the files you ask for. The
+The daemon connects to every open tab so it can tell which one is on screen, but it only turns on console and
+network recording for the tab it's working on. If that tab closes, commands stop with an error instead of moving to
+another tab. Private tabs (mail, banking) are still reachable through the inspector while they're open, so close
+them if you don't want them anywhere near a session.
+
+Nothing is stored except the daemon's state in `~/.cache/iphone-webkit-inspector/` (owner-only; the log keeps
+the site origin of each tab, not full URLs) and the files you ask for. The
 daemon keeps recent console and network events in memory until it stops (`ios.mjs stop`, or when the bridge exits).
 
 ## Limits

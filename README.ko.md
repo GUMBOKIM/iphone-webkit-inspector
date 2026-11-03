@@ -56,7 +56,8 @@ Playwright나 Chrome 개발자 도구로는 실제 아이폰의 Safari를 조종
 | 서비스 워커, Cache Storage | ✅ | ⚠️ | ❌ |
 | **성능** | | | |
 | 페이지·리소스 로딩 시간 | ✅ | ⚠️ JS로 | ✅ `perf` |
-| FCP, CLS | ✅ | ⚠️ JS로 | ✅ |
+| FCP | ✅ | ⚠️ JS로 | ✅ |
+| CLS | ✅ | ⚠️ JS로 | ❌ Safari가 layout-shift를 지원하지 않음 |
 | LCP | ✅ | ⚠️ | ❌ Safari 18이 값을 주지 않음 |
 | 성능 트레이스 | ✅ | ⚠️ Chromium만 | ✅ Chrome 형식, 개발자 도구에서 열림 |
 | JS CPU 프로파일 | ✅ | ⚠️ Chromium만 | ⚠️ 샘플 비율, 정확한 ms는 없음 |
@@ -75,7 +76,7 @@ Playwright나 Chrome 개발자 도구로는 실제 아이폰의 Safari를 조종
 | **테스트** | | | |
 | 테스트 러너와 assertion | ❌ | ✅ | ❌ |
 
-정리하면, 개발자 도구를 열어서 보통 하는 일은 실제 아이폰에서도 거의 다 됩니다. 안 되는 것은 OS 수준 입력(브라우저 UI, 키보드), 속도 제한, Lighthouse, LCP입니다.
+정리하면, 개발자 도구를 열어서 보통 하는 일은 실제 아이폰에서도 거의 다 됩니다. 안 되는 것은 OS 수준 입력(브라우저 UI, 키보드), 속도 제한, Lighthouse, LCP, CLS입니다.
 
 ## 명령
 
@@ -86,10 +87,10 @@ Playwright나 Chrome 개발자 도구로는 실제 아이폰의 Safari를 조종
 | 설정 | `doctor`, `launch safari\|chrome [url]`, `status`, `stop`, `report` |
 | 페이지 | `tabs`, `use`, `open`, `reload`, `close`, `snapshot`, `eval`, `tap`, `type`, `shot`, `record` |
 | Elements | `dom`, `styles`, `a11y`, `highlight`, `pseudo`, `listeners`, `layers` |
-| 콘솔과 네트워크 | `logs`, `net`, `req`, `body`, `har`, `ws`, `block`, `mock`, `unmock`, `nocache`, `events` |
+| 콘솔과 네트워크 | `logs`, `net`, `req`, `body`, `har`, `ws`, `block`, `mock`, `mocks`, `unmock`, `nocache`, `events` |
 | Sources | `scripts`, `source`, `break`, `pause-on`, `pause`, `paused`, `step`, `frame-eval`, `resume` |
 | Application | `cookies`, `storage`, `idb` |
-| 성능 | `perf`, `trace`, `profile`, `usage`, `heap` |
+| 성능 | `perf`, `trace`, `profile`, `usage`, `heap`, `fps` |
 | 렌더링 | `media`, `paintflash`, `ua`, `js`, `inject` |
 | 그 밖의 모든 것 | `cdp <Method> <json>` |
 
@@ -126,7 +127,7 @@ iPhone 15 Pro, iOS 18.6.2, Xcode 27.2, pymobiledevice3 11.49.2에서 시험했�
 
 - `node skills/iphone-webkit-inspector/ios.mjs`: Claude가 부르는 CLI입니다. 소스를 그대로 읽어 볼 수 있고 npm 의존성도 없습니다. 첫 명령을 실행할 때 같은 스크립트가 백그라운드 데몬으로 뜨는데, 이 데몬은 `127.0.0.1:9334`에서만 연결을 받습니다.
 - `uvx --from pymobiledevice3==11.49.2 python bridge_guard.py webinspector cdp --port 9333`: Web Inspector 브리지입니다. 이쪽도 `127.0.0.1:9333`에서만 연결을 받습니다. 처음 실행하면 `uv`가 PyPI에서 이 버전의 pymobiledevice3를 내려받고, Python 3.12가 없으면 uv가 관리하는 Python 3.12도 받습니다.
-- `bridge_guard.py`는 브리지 앞에서 웹페이지가 보낸 요청(`Origin` 헤더가 있는 요청)과 Host가 `127.0.0.1`/`localhost`가 아닌 요청을 막습니다. 그래서 Mac에 열어 둔 웹사이트가 브리지를 거쳐 아이폰에 닿을 수 없습니다. 데몬도 실행할 때마다 만드는 랜덤 토큰이 있어야 명령을 받습니다. 토큰은 `~/.cache/iphone-webkit-inspector/token`에 본인만 읽을 수 있게(권한 600) 저장합니다.
+- `bridge_guard.py`는 브리지 앞에서 웹페이지가 보낸 요청(`Origin` 헤더가 있는 요청)과 Host가 `127.0.0.1`/`localhost`가 아닌 요청을 막습니다. 그래서 Mac에 열어 둔 웹사이트가 브리지를 거쳐 아이폰에 닿을 수 없습니다. 브리지는 데몬이 환경 변수로 넘겨주는 실행마다 다른 비밀값도 요구하므로, 같은 Mac의 다른 사용자도 쓸 수 없습니다. 데몬은 따로 실행마다 만드는 랜덤 토큰이 있어야 명령을 받고, 이 토큰은 `~/.cache/iphone-webkit-inspector/token`에 본인만 읽을 수 있게(권한 600) 저장합니다. 다른 로컬 개발 도구와 마찬가지로, 같은 사용자 권한으로 도는 프로세스는 이 토큰을 읽을 수 있습니다.
 - `xcrun devicectl`: 아이폰을 찾고 Safari나 Chrome을 실행합니다.
 - 브리지가 아이폰에 붙는 길은 USB면 macOS의 `usbmuxd`, Wi-Fi면 macOS가 Xcode용으로 열어 두는 CoreDevice 터널(`--native`)입니다. 어느 쪽이든 Mac과 아이폰 사이에서만 오갑니다.
 - 아이폰에서 여는 페이지는 평소처럼 인터넷에서 불러오지만, 플러그인 자체가 바깥으로 보내는 것은 없습니다. `report`도 링크만 출력하고, 이슈를 올릴지는 사용자가 정합니다.
@@ -135,9 +136,11 @@ iPhone 15 Pro, iOS 18.6.2, Xcode 27.2, pymobiledevice3 11.49.2에서 시험했�
 
 ## 개인정보
 
-명령이 돌려주는 내용은 모두 Claude Code 세션에 들어가고, 다른 도구 결과와 마찬가지로 모델 제공자에게 전달됩니다. 아이폰에서 요청한 내용도 포함됩니다. 페이지 텍스트와 HTML, 콘솔 메시지, 요청·응답 헤더와 본문, localStorage·sessionStorage·IndexedDB 내용, 쿠키 이름이 해당합니다(쿠키 값은 `cookies --values`를 쓸 때만 보입니다). 그렇게 공유해도 괜찮은 탭에서만 쓰고, 메일이나 은행 같은 개인 탭은 닫아 두거나 뒤에 두세요.
+명령이 돌려주는 내용은 모두 Claude Code 세션에 들어가고, 다른 도구 결과와 마찬가지로 모델 제공자에게 전달됩니다. 아이폰에서 요청한 내용도 포함됩니다. 페이지 텍스트와 HTML, 콘솔 메시지, 요청·응답 헤더와 본문, localStorage·sessionStorage·IndexedDB 내용, 쿠키 이름이 해당합니다(쿠키 값은 `cookies --values`를 쓸 때만 보입니다). `snapshot`은 비밀번호 칸에 입력된 값을 보여 주지 않습니다. 그렇게 공유해도 괜찮은 탭에서만 쓰세요.
 
-`~/.cache/iphone-webkit-inspector/`의 데몬 상태와 요청한 파일 말고는 아무것도 저장하지 않습니다. 데몬은 최근 콘솔·네트워크 이벤트를 메모리에만 들고 있다가, 멈추면(`ios.mjs stop`, 또는 브리지 종료) 버립니다.
+데몬은 어느 탭이 화면에 떠 있는지 알기 위해 열린 탭에 모두 연결하지만, 콘솔과 네트워크 기록은 작업 중인 탭에서만 켭니다. 그 탭이 닫히면 다른 탭으로 넘어가지 않고 오류를 내며 멈춥니다. 다만 메일이나 은행 같은 개인 탭도 열려 있는 동안은 인스펙터로 접근할 수 있는 상태이니, 신경 쓰이면 닫아 두세요.
+
+`~/.cache/iphone-webkit-inspector/`의 데몬 상태(본인만 읽을 수 있고, 로그에는 전체 URL 대신 사이트 주소(origin)만 남습니다)와 요청한 파일 말고는 아무것도 저장하지 않습니다. 데몬은 최근 콘솔·네트워크 이벤트를 메모리에만 들고 있다가, 멈추면(`ios.mjs stop`, 또는 브리지 종료) 버립니다.
 
 ## 한계
 

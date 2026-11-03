@@ -9,7 +9,7 @@
     {
       "name": "iphone-webkit-inspector",
       "source": "./",
-      "description": "Inspect and drive Safari or Chrome on a USB-connected iPhone through Web Inspector.",
+      "description": "Inspect and drive Safari or Chrome on a real iPhone over USB or Wi-Fi through Web Inspector.",
       "category": "development",
       "tags": ["ios", "safari", "mobile", "debugging", "performance"]
     }
