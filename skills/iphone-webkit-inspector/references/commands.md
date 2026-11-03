@@ -10,18 +10,19 @@ Element targets (<el>): CSS selector | text=<label> | @e12 (from snapshot) | x y
  setup
   start | stop | status        background bridge (auto-starts on first command)
   doctor                       check Xcode, the iPhone, and the Safari/Chrome inspector settings
-  launch [safari|chrome|<bundle-id>] [url] [--restart]   open an app (new tab when a url is given)
+  launch [safari|chrome|<bundle-id>] [url] [--restart]   bring an app up; with a url Safari opens it in a new tab,
+                               or brings forward a tab that already shows that URL
   report [--title t] [--what text]   collect redacted diagnostics and print a prefilled GitHub issue link
 
  tabs and pages
   tabs                         list tabs (visible = on the iPhone screen)
-  use <id|url-part>            pick the tab to work on (default: the visible one)
+  use <id|n|url-part>          pick the tab to work on: full id, its last number (19), or part of the URL
   open <url> | reload | close  navigate (waits for load, clears logs/net) | reload | close tab
   snapshot [--all]             elements you can act on, as @eN refs
   eval <js> [--gesture]        run JS; expression, or statements with return/await
   tap <el>                     touch + click, run as a user gesture
   type <el> <text>             set an input's value and fire input/change
-  shot [path]                  screenshot (PNG, device resolution)
+  shot [path] [--device]       screenshot of the page; --device = whole screen incl. Safari's bars and keyboard
   record start [dir] | record stop      screen recording as JPEG frames named <n>-<ms>ms.jpg
 
  elements
@@ -64,6 +65,7 @@ Element targets (<el>): CSS selector | text=<label> | @e12 (from snapshot) | x y
   perf [url-part] [--slow] [--json]     Performance API: TTFB, DCL, load, FCP, CLS, resource waterfall
   trace start [--screenshots] | trace stop [out.json]   Chrome-format performance trace + summary
   profile start | profile stop [out.cpuprofile]         JS CPU profile + hottest functions
+  fps [seconds]                display frame rate on the phone, one sample per second
   usage start | usage stop [out.json]   CPU (per thread) and memory by category every ~0.5s
   heap [out.heapsnapshot]      JS heap snapshot
 
@@ -83,8 +85,8 @@ Element targets (<el>): CSS selector | text=<label> | @e12 (from snapshot) | x y
 **cookies.** Prints names and attributes; values only with `--values`. `--clear [name]` deletes cookies for the
 current page and can log the user out, so ask first.
 
-**Pages.** `open` clears the console and network buffers and waits for `load`. `launch <app> <url>` opens a new tab and
-switches to it. `close` only closes tabs opened from a URL (Safari blocks closing tabs the user opened).
+**Pages.** `open` clears the console and network buffers and waits for `load`. `launch <app> <url>` opens a new tab, or brings
+forward a tab already showing that URL; commands then follow the visible tab. `close` only closes tabs opened from a URL (Safari blocks closing tabs the user opened).
 
 **snapshot.** Lists visible links, buttons, inputs, headings, media and anything with a role or `tabindex`, tagged as
 `@e1`, `@e2`… on the page itself (`data-iwi-ref`). Refs change on every snapshot and navigation. `--all` includes
@@ -108,6 +110,11 @@ process and loses the trace. Summary shows main-thread time per event type and t
 Chrome DevTools → Performance → Load profile.
 
 **profile.** Sample shares per function. The bridge's sample timing is unreliable, so there are no milliseconds.
+
+**shot --device / fps.** Use the phone's developer services through the CoreDevice tunnel macOS keeps for Xcode.
+`shot --device` is the full 1179×2556 screen including status bar, Safari's bars and the keyboard. `fps` reads
+Core Animation's display frame rate once per second; 0 means nothing on screen changed. Device-level network
+throttling (DVT condition inducer) was tested and did not slow Safari's traffic, so it isn't offered.
 
 **usage.** Samples every ~0.5s: total and main-thread CPU %, memory per category (JS, JIT, images, layers, page).
 

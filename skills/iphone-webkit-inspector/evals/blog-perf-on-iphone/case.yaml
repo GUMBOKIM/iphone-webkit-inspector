@@ -1,0 +1,4 @@
+schema_version: "1.1"
+name: blog-perf-on-iphone
+expected_outcome: |
+  perf.md has TTFB and FCP in ms measured on the iPhone, the number of requests, and the slowest resource URL, and does not invent an LCP value.

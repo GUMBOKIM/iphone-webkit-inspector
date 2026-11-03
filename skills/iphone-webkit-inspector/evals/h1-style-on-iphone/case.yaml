@@ -1,0 +1,4 @@
+schema_version: "1.1"
+name: h1-style-on-iphone
+expected_outcome: |
+  Measured on the real iPhone: the h1 is 24px; color and font-family come from the "h1, h2, h3, h4" rule in the Base CSS file (color: var(--headings), font-family: var(--font-sans)); a screenshot PNG from the phone is saved.

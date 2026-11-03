@@ -25,6 +25,8 @@ the exact flags; `ios help` prints the same list.
 
 ## Before using
 
+- `ios launch safari <url>` opens the URL in a new tab, but if a tab already shows that URL Safari brings that tab
+  forward instead (and `close` can't close a tab the user opened). Check `ios tabs` after launching.
 - The phone is on USB or the same Wi-Fi as the Mac (chosen automatically; `ios status` shows which), unlocked, with
   the browser in front. If `ios tabs` is empty or nothing is visible, try `ios launch safari`. If that doesn't help,
   run `ios doctor` and pass its ✗ fix on to the user rather than retrying.
@@ -39,16 +41,17 @@ the exact flags; `ios help` prints the same list.
 
 Look before acting. `ios snapshot` lists what's on screen as `@eN` refs with role, name and box; act with
 `ios tap @eN` / `ios type @eN <text>`. Refs reset on every snapshot and navigation, so snapshot again after the
-page changes. `ios shot <path>` and reading the PNG is the fastest way to see what the user sees.
+page changes. `ios shot <path>` and reading the PNG is the fastest way to see the page; `ios shot <path> --device` shows the
+whole screen as the user sees it, including Safari's address bar, toolbar and the keyboard.
 
 Pick the tool by question:
 
 | Question | Commands |
 |---|---|
-| What does it look like / why is it laid out that way? | `shot`, `dom <el>`, `styles <el> --computed`, `highlight <el>` |
+| What does it look like / why is it laid out that way? | `shot`, `shot --device` (whole screen with Safari's bars, for 100vh and keyboard issues), `dom <el>`, `styles <el> --computed`, `highlight <el>` |
 | Is something broken? | `logs --errors`, `net --failed`, `req`/`body` |
 | What does the app do on tap? | `listeners <el>`, `tap`, then `logs` / `net` |
-| Why is it slow? | `perf` first; `trace` around a reload for main-thread work; `profile` for hot JS; `usage` for CPU/memory over time |
+| Why is it slow or janky? | `perf` first; `trace` around a reload for main-thread work; `profile` for hot JS; `fps 5` while it animates; `usage` for CPU/memory over time |
 | What state is stored? | `cookies` (names only; `--values` when the user wants them), `storage local`, `idb` |
 | Where does this JS go wrong? | `pause-on uncaught`, `break <url-part> <line>`, then `paused`, `step`, `frame-eval`, `resume` |
 | How does it behave if…? | `mock`/`block`, `nocache on`, `media dark`, `ua <string>`, `js off`, `inject` |

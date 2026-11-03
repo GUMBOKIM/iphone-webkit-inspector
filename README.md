@@ -26,7 +26,7 @@ and it can't attach to a real iPhone. This plugin works on Safari or Chrome runn
 | Element snapshot with refs for the agent | ✅ (DevTools MCP) | ✅ (aria snapshot) | ✅ `snapshot`, `@e12` |
 | Click / tap, type | ✅ | ✅ real input events | ⚠️ in-page events with user-gesture emulation |
 | Native browser UI, permission prompts, keyboard | ❌ | ⚠️ dialogs only | ❌ |
-| Screenshot | ✅ | ✅ incl. full page | ⚠️ visible viewport |
+| Screenshot | ✅ | ✅ incl. full page | ✅ page, or the whole phone screen with Safari's bars |
 | Screen recording | ✅ screencast | ✅ video | ⚠️ JPEG frames, ~2–3 fps |
 | **Elements** | | | |
 | DOM and outerHTML | ✅ | ✅ | ✅ |
@@ -62,6 +62,7 @@ and it can't attach to a real iPhone. This plugin works on Safari or Chrome runn
 | Performance trace | ✅ | ⚠️ Chromium only | ✅ Chrome-format, opens in DevTools |
 | JS CPU profile | ✅ | ⚠️ Chromium only | ⚠️ sample shares, no exact ms |
 | CPU and memory usage over time | ✅ | ❌ | ✅ per thread and per category |
+| Real display frame rate | ⚠️ FPS meter | ❌ | ✅ `fps`, from the device |
 | Heap snapshot | ✅ | ⚠️ Chromium only | ✅ |
 | Lighthouse | ✅ | ❌ | ❌ |
 | CPU throttling | ✅ | ⚠️ Chromium only | ❌ |

@@ -480,7 +480,7 @@ async function runDaemon() {
 				return null;
 			}
 			const states = await tabStates();
-			const hit = states.find((s) => s.id === match) || states.find((s) => s.url.includes(match));
+			const hit = states.find((s) => s.id === match) || (/^\d+$/.test(match) && states.find((s) => s.id.endsWith(':' + match))) || states.find((s) => s.url.includes(match));
 			if (!hit) throw new Error(`no tab matches "${match}"`);
 			current = hit.id;
 			return hit;
@@ -1216,6 +1216,27 @@ async function report({ title, what }) {
 	console.log(`open to file an issue (review it first):\nhttps://github.com/${REPO}/issues/new?labels=bug&title=${encodeURIComponent(t)}&body=${encodeURIComponent(short)}`);
 }
 
+// DVT developer services (full-screen screenshot, display FPS). On iOS 17+ they need the developer
+// tunnel; --native reuses the one macOS already keeps for Xcode, over Wi-Fi or USB.
+function pmd3Dev(args, { onLine, timeoutMs } = {}) {
+	return new Promise((res) => {
+		let out = '';
+		const p = spawn('uvx', ['--python', '3.12', '--from', PMD3, 'pymobiledevice3', 'developer', ...args, '--native'], { stdio: ['ignore', 'pipe', 'pipe'] });
+		const take = (d) => {
+			out += d;
+			if (onLine) for (const l of String(d).split('\n')) if (l.trim()) onLine(l.trim());
+		};
+		p.stdout.on('data', take);
+		p.stderr.on('data', (d) => (out += d));
+		const timer = timeoutMs && setTimeout(() => p.kill('SIGINT'), timeoutMs);
+		p.on('exit', (code) => {
+			if (timer) clearTimeout(timer);
+			res({ code, out });
+		});
+		p.on('error', () => res({ code: -1, out }));
+	});
+}
+
 async function connectedUdid() {
 	if (process.env.IOS_UDID) return process.env.IOS_UDID;
 	const out = join(tmpdir(), `devicectl-${process.pid}.json`);
@@ -1236,18 +1257,19 @@ Element targets (<el>): CSS selector | text=<label> | @e12 (from snapshot) | x y
  setup
   start | stop | status        background bridge (auto-starts on first command)
   doctor                       check Xcode, the iPhone, and the Safari/Chrome inspector settings
-  launch [safari|chrome|<bundle-id>] [url] [--restart]   open an app (new tab when a url is given)
+  launch [safari|chrome|<bundle-id>] [url] [--restart]   bring an app up; with a url Safari opens it in a new tab,
+                               or brings forward a tab that already shows that URL
   report [--title t] [--what text]   collect redacted diagnostics and print a prefilled GitHub issue link
 
  tabs and pages
   tabs                         list tabs (visible = on the iPhone screen)
-  use <id|url-part>            pick the tab to work on (default: the visible one)
+  use <id|n|url-part>          pick the tab to work on: full id, its last number (19), or part of the URL
   open <url> | reload | close  navigate (waits for load, clears logs/net) | reload | close tab
   snapshot [--all]             elements you can act on, as @eN refs
   eval <js> [--gesture]        run JS; expression, or statements with return/await
   tap <el>                     touch + click, run as a user gesture
   type <el> <text>             set an input's value and fire input/change
-  shot [path]                  screenshot (PNG, device resolution)
+  shot [path] [--device]       screenshot of the page; --device = whole screen incl. Safari's bars and keyboard
   record start [dir] | record stop      screen recording as JPEG frames named <n>-<ms>ms.jpg
 
  elements
@@ -1290,6 +1312,7 @@ Element targets (<el>): CSS selector | text=<label> | @e12 (from snapshot) | x y
   perf [url-part] [--slow] [--json]     Performance API: TTFB, DCL, load, FCP, CLS, resource waterfall
   trace start [--screenshots] | trace stop [out.json]   Chrome-format performance trace + summary
   profile start | profile stop [out.cpuprofile]         JS CPU profile + hottest functions
+  fps [seconds]                display frame rate on the phone, one sample per second
   usage start | usage stop [out.json]   CPU (per thread) and memory by category every ~0.5s
   heap [out.heapsnapshot]      JS heap snapshot
 
@@ -1394,6 +1417,12 @@ async function main() {
 		}
 		case 'shot': {
 			const path = resolve(pos[0] || join(tmpdir(), `iphone-${Date.now()}.png`));
+			if (flags.has('--device')) {
+				// The whole screen as the user sees it: status bar, Safari's address bar and toolbar, keyboard.
+				const r = await pmd3Dev(['dvt', 'screenshot', path], { timeoutMs: 60000 });
+				if (!existsSync(path)) throw new Error(`device screenshot failed: ${r.out.trim().split('\n').pop()}`);
+				return console.log(path);
+			}
 			return console.log((await call('shot', { path })).path);
 		}
 		case 'snapshot': {
@@ -1566,6 +1595,28 @@ async function main() {
 				el.dispatchEvent(new Event('change', { bubbles: true }));
 				return el.value;`;
 			return console.log(await call('eval', { js, gesture: true }));
+		}
+		case 'fps': {
+			// Display frame rate from Core Animation, one sample per second, while the user or a script
+			// interacts. 0 means nothing on screen changed in that second.
+			const secs = Number(pos[0] || 5);
+			const samples = [];
+			await pmd3Dev(['dvt', 'fps'], {
+				timeoutMs: (secs + 4) * 1000,
+				onLine: (l) => {
+					try {
+						const j = JSON.parse(l);
+						if (typeof j.fps === 'number' && samples.length < secs) {
+							samples.push(j.fps);
+							console.log(`${String(samples.length).padStart(3)}s  ${String(j.fps).padStart(3)} fps`);
+						}
+					} catch {}
+				},
+			});
+			if (!samples.length) throw new Error('no FPS samples (is the phone unlocked and paired?)');
+			const avg = Math.round(samples.reduce((a, b) => a + b, 0) / samples.length);
+			console.log(`avg ${avg} fps, min ${Math.min(...samples)}, max ${Math.max(...samples)} over ${samples.length}s (0 = nothing on screen changed)`);
+			return;
 		}
 		case 'trace': {
 			if (pos[0] === 'start') return console.log(await call('traceStart', { screenshots: flags.has('--screenshots') }));
