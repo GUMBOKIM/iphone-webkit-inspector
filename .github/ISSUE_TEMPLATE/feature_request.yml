@@ -1,0 +1,22 @@
+name: Feature request
+description: A DevTools or Playwright capability you want on a real iPhone
+title: "Feature: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: want
+    attributes:
+      label: What you want to do
+      description: The task, and the Chrome DevTools / Playwright feature you'd use for it on desktop, if any.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why on a real iPhone
+      description: What the desktop or simulator version misses.
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Relevant WebKit Inspector protocol domains or methods, if you know them.

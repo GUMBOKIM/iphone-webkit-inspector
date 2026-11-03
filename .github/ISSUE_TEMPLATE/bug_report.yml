@@ -1,0 +1,49 @@
+name: Bug report
+description: Something doesn't work on your iPhone or Mac
+title: "Bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Fastest way: ask Claude to run `report`, or run it yourself:
+        `node <plugin>/skills/iphone-webkit-inspector/ios.mjs report --title "..." --what "..."`.
+        It collects versions, `doctor` output and the daemon log, with device names, UDIDs and visited URLs redacted.
+        Paste its output below, or use `--submit` to file it with `gh`.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The command or request you ran, what you expected, and what you got instead.
+      placeholder: |
+        ran `trace start`, reloaded, `trace stop` → "5 events over 0ms"
+        expected a full trace of the page load
+    validations:
+      required: true
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Connection
+      options: [USB, Wi-Fi, Not sure]
+    validations:
+      required: true
+  - type: dropdown
+    id: browser
+    attributes:
+      label: Browser on the iPhone
+      options: [Safari, Chrome, Other]
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment and diagnostics
+      description: Output of `report` (or at least `doctor`, macOS / Xcode / iOS versions, iPhone model).
+      render: markdown
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Screenshots, the page URL if it's public, a minimal page that reproduces it.

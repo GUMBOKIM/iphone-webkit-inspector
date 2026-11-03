@@ -10,7 +10,7 @@
 import { spawn } from 'node:child_process';
 import { mkdirSync, openSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { createServer } from 'node:http';
-import { homedir, tmpdir } from 'node:os';
+import { homedir, hostname, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -260,6 +260,44 @@ function summarizeProfile(profile) {
 	return { durationMs: Math.round((profile.endTime - profile.startTime) / 1000), samples: profile.samples?.length || 0, busySamples: busy, topSelf: fmt(self), topTotal: fmt(total) };
 }
 
+// JS expression that finds one element on the page from: a CSS selector, `text=<label>`,
+// `@e12` (a ref from `snapshot`), or `x y` coordinates.
+function targetJs(sel) {
+	const s = String(sel).trim();
+	const xy = s.match(/^(\d+)\s+(\d+)$/);
+	if (xy) return `document.elementFromPoint(${xy[1]}, ${xy[2]})`;
+	if (/^@e\d+$/.test(s)) return `document.querySelector('[data-iwi-ref="${s.slice(1)}"]')`;
+	if (s.startsWith('text=')) {
+		const t = JSON.stringify(s.slice(5));
+		const q = `'button, a, [role=button], [role=link], [role=tab], [role=menuitem], label, summary, input[type=button], input[type=submit], [onclick]'`;
+		return `([...document.querySelectorAll(${q})].find((e) => e.offsetParent !== null && (e.innerText || e.value || '').trim() === ${t}) || [...document.querySelectorAll(${q})].find((e) => e.offsetParent !== null && (e.innerText || e.value || '').includes(${t})) || [...document.querySelectorAll('h1,h2,h3,h4,p,li,span,div')].find((e) => e.offsetParent !== null && e.children.length === 0 && (e.innerText || '').trim() === ${t}))`;
+	}
+	return `document.querySelector(${JSON.stringify(s)})`;
+}
+
+// Runs on the phone: lists what an agent can act on, tagging each element with data-iwi-ref.
+const SNAPSHOT_JS = `
+	document.querySelectorAll('[data-iwi-ref]').forEach((e) => e.removeAttribute('data-iwi-ref'));
+	const sel = 'a[href], button, input, select, textarea, summary, label, [role=button], [role=link], [role=tab], [role=checkbox], [role=switch], [role=menuitem], [role=slider], [onclick], [tabindex]:not([tabindex="-1"]), [contenteditable=""], [contenteditable=true], h1, h2, h3, h4, video, audio, canvas, iframe';
+	const vh = innerHeight, out = [];
+	let n = 0;
+	for (const el of document.querySelectorAll(sel)) {
+		const r = el.getBoundingClientRect();
+		if (!r.width || !r.height) continue;
+		const cs = getComputedStyle(el);
+		if (cs.visibility === 'hidden' || cs.display === 'none' || +cs.opacity === 0) continue;
+		if (ONLY_VIEWPORT && (r.bottom < 0 || r.top > vh)) continue;
+		const ref = 'e' + ++n;
+		el.setAttribute('data-iwi-ref', ref);
+		const tag = el.tagName.toLowerCase();
+		const role = el.getAttribute('role') || (tag === 'a' ? 'link' : /^h\\d$/.test(tag) ? 'heading' : tag === 'input' ? 'input:' + (el.type || 'text') : tag);
+		const name = (el.getAttribute('aria-label') || el.innerText || el.value || el.placeholder || el.title || el.alt || el.getAttribute('href') || '').trim().replace(/\\s+/g, ' ').slice(0, 70);
+		const state = [el.disabled && 'disabled', el.checked && 'checked', el.getAttribute('aria-pressed') === 'true' && 'pressed', el.getAttribute('aria-expanded') === 'true' && 'expanded', document.activeElement === el && 'focused', (r.bottom < 0 || r.top > vh) && 'offscreen'].filter(Boolean).join(',');
+		out.push({ ref, role, name, state, box: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)] });
+	}
+	return { url: location.href, title: document.title, viewport: [innerWidth, innerHeight], scrollY: Math.round(scrollY), items: out };
+`;
+
 // Runs on the phone: navigation milestones, paint metrics and a per-resource timing breakdown.
 const PERF_JS = `
 	const r = (n) => Math.round(n);
@@ -395,6 +433,32 @@ async function runDaemon() {
 		if (!vis) throw new Error('No visible Safari tab. Unlock the iPhone and bring Safari (the tab to inspect) to the front, then retry. If it keeps failing, run `ios.mjs doctor`.');
 		current = vis.id;
 		return tabs.get(current);
+	}
+
+	// Resolve a page element (any targetJs form) to a DOM nodeId by tagging it, then querying for the tag.
+	async function nodeFor(tab, target) {
+		const tag = 'p' + Date.now().toString(36);
+		const ok = await tab.evaluate(`(() => { const el = ${target}; if (!el) return false; el.setAttribute('data-iwi-pick', '${tag}'); return true; })()`);
+		if (!ok) throw new Error('no element matches');
+		const doc = await tab.send('DOM.getDocument', { depth: 0 });
+		const q = await tab.send('DOM.querySelector', { nodeId: doc.result.root.nodeId, selector: `[data-iwi-pick="${tag}"]` });
+		tab.evaluate(`document.querySelector('[data-iwi-pick="${tag}"]')?.removeAttribute('data-iwi-pick')`).catch(() => {});
+		if (!q.result?.nodeId) throw new Error('could not resolve element');
+		return q.result.nodeId;
+	}
+
+	// Debugger domain on demand: tracks parsed scripts and the current pause.
+	async function ensureDebugger(tab) {
+		if (tab.debuggerOn) return;
+		tab.scripts ||= new Map();
+		tab.on('Debugger.scriptParsed', (p) => tab.scripts.set(p.scriptId, p));
+		tab.on('Debugger.paused', (p) => (tab.pausedAt = p));
+		tab.on('Debugger.resumed', () => (tab.pausedAt = null));
+		tab.on('Debugger.globalObjectCleared', () => { tab.scripts.clear(); tab.pausedAt = null; });
+		const r = await tab.send('Debugger.enable');
+		if (r.error) throw new Error(r.error.message);
+		tab.debuggerOn = true;
+		await sleep(300); // scriptParsed for already-loaded scripts arrives right after enable
 	}
 
 	const handlers = {
@@ -671,6 +735,255 @@ async function runDaemon() {
 			const peak = (k) => samples.reduce((a, s) => (s[k] > (a?.[k] ?? -1) ? s : a), null);
 			return { path, samples, peakCpu: peak('cpu'), peakMain: peak('main'), peakMem: peak('memMB'), requests: events.filter((e) => e.method === 'Network.requestWillBeSent').length };
 		},
+		// ---- Elements
+		async snapshot({ all }) {
+			const tab = await currentTab();
+			return tab.evaluate(`(() => { const ONLY_VIEWPORT = ${!all}; ${SNAPSHOT_JS} })()`);
+		},
+		async dom({ target, depth = 2000 }) {
+			const tab = await currentTab();
+			return tab.evaluate(`(() => {
+				const el = ${target};
+				if (!el) throw new Error('no element');
+				const r = el.getBoundingClientRect(), cs = getComputedStyle(el);
+				const html = el.outerHTML;
+				return { tag: el.tagName.toLowerCase(), box: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
+					margin: cs.margin, padding: cs.padding, border: cs.borderWidth, display: cs.display, position: cs.position,
+					html: html.length > ${depth} ? html.slice(0, ${depth}) + '…' : html };
+			})()`);
+		},
+		async styles({ target, computed }) {
+			const tab = await currentTab();
+			const nodeId = await nodeFor(tab, target);
+			await tab.send('CSS.enable');
+			const m = await tab.send('CSS.getMatchedStylesForNode', { nodeId, includePseudo: false, includeInherited: false });
+			if (m.error) throw new Error(m.error.message);
+			const rules = (m.result.matchedCSSRules || []).map((x) => {
+				const r = x.rule;
+				const src = r.sourceURL ? `${r.sourceURL.split('/').pop().split('?')[0]}:${(r.sourceLine ?? 0) + 1}` : r.origin;
+				const props = (r.style?.cssProperties || []).filter((p) => p.text && !p.disabled && p.status !== 'inactive').map((p) => `${p.name}: ${p.value}${p.priority ? ' !' + p.priority : ''}${p.parsedOk === false ? ' (invalid)' : ''}`);
+				return { selector: r.selectorList?.text, origin: r.origin, source: src, media: (r.media || []).map((q) => q.text).join(' and ') || undefined, props };
+			}).reverse(); // most specific / last first, like DevTools
+			const inline = m.result.inlineStyle?.cssProperties?.filter((p) => p.text).map((p) => `${p.name}: ${p.value}`) || [];
+			let comp;
+			if (computed) {
+				const c = await tab.send('CSS.getComputedStyleForNode', { nodeId });
+				const want = computed === true ? null : new Set(String(computed).split(','));
+				comp = Object.fromEntries((c.result?.computedStyle || []).filter((p) => (want ? want.has(p.name) : true)).map((p) => [p.name, p.value]));
+			}
+			return { inline, rules, computed: comp };
+		},
+		async a11y({ target }) {
+			const tab = await currentTab();
+			const nodeId = await nodeFor(tab, target);
+			const r = await tab.send('DOM.getAccessibilityPropertiesForNode', { nodeId });
+			if (r.error) throw new Error(r.error.message);
+			const { childNodeIds, parentNodeId, nodeId: _n, controlledNodeIds, flowedNodeIds, ownedNodeIds, labelledByNodeIds, ...props } = r.result.properties;
+			return props;
+		},
+		async highlight({ target, off }) {
+			const tab = await currentTab();
+			if (off) return (await tab.send('DOM.hideHighlight')).error ? 'failed' : 'hidden';
+			const nodeId = await nodeFor(tab, target);
+			const cfg = { showInfo: true, contentColor: { r: 111, g: 168, b: 220, a: 0.55 }, paddingColor: { r: 147, g: 196, b: 125, a: 0.55 }, borderColor: { r: 255, g: 229, b: 153, a: 0.66 }, marginColor: { r: 246, g: 178, b: 107, a: 0.66 } };
+			const r = await tab.send('DOM.highlightNode', { nodeId, highlightConfig: cfg });
+			if (r.error) throw new Error(r.error.message);
+			return 'highlighted on the phone (ios highlight --off to clear)';
+		},
+		async pseudo({ target, classes }) {
+			const tab = await currentTab();
+			const nodeId = await nodeFor(tab, target);
+			await tab.send('CSS.enable');
+			const list = classes && classes !== 'off' ? classes.split(',') : [];
+			const r = await tab.send('CSS.forcePseudoState', { nodeId, forcedPseudoClasses: list });
+			if (r.error) throw new Error(r.error.message);
+			return { forced: list };
+		},
+		async layers() {
+			const tab = await currentTab();
+			await tab.send('LayerTree.enable');
+			const doc = await tab.send('DOM.getDocument', { depth: 0 });
+			const r = await tab.send('LayerTree.layersForNode', { nodeId: doc.result.root.nodeId });
+			if (r.error) throw new Error(r.error.message);
+			const out = [];
+			for (const l of r.result.layers || []) {
+				const why = await tab.send('LayerTree.reasonsForCompositingLayer', { layerId: l.layerId });
+				const reasons = Object.entries(why.result?.compositingReasons || {}).filter(([, v]) => v).map(([k]) => k);
+				let node = '';
+				if (l.nodeId) {
+					const d = await tab.send('DOM.describeNode', { nodeId: l.nodeId });
+					const n = d.result?.node;
+					if (n) node = (n.localName || n.nodeName) + (n.attributes ? (() => { const a = n.attributes; const id = a[a.indexOf('id') + 1]; const cl = a[a.indexOf('class') + 1]; return (a.includes('id') ? '#' + id : '') + (a.includes('class') ? '.' + String(cl).split(' ')[0] : ''); })() : '');
+				}
+				out.push({ layerId: l.layerId, node: node || (l.isGeneratedContent ? 'pseudo' : l.isAnonymous ? 'anonymous' : ''), size: `${Math.round(l.bounds.width)}×${Math.round(l.bounds.height)}`, memoryKB: Math.round((l.memory || 0) / 1024), paints: l.paintCount, reasons });
+			}
+			return out;
+		},
+
+		// ---- Application
+		async cookies({ clear }) {
+			const tab = await currentTab();
+			const r = await tab.send('Page.getCookies');
+			if (r.error) throw new Error(r.error.message);
+			const list = r.result.cookies || [];
+			if (clear) {
+				for (const c of list.filter((c) => clear === true || c.name === clear)) await tab.send('Page.deleteCookie', { cookieName: c.name, url: tab.url });
+				return { deleted: list.filter((c) => clear === true || c.name === clear).map((c) => c.name) };
+			}
+			return list.map((c) => ({ name: c.name, value: c.value.length > 60 ? c.value.slice(0, 60) + '…' : c.value, domain: c.domain, path: c.path, expires: c.session ? 'session' : new Date(c.expires).toISOString().slice(0, 10), httpOnly: c.httpOnly, secure: c.secure, sameSite: c.sameSite }));
+		},
+		async storage({ kind = 'local', clear }) {
+			const tab = await currentTab();
+			const store = kind === 'session' ? 'sessionStorage' : 'localStorage';
+			if (clear) return tab.evaluate(`(() => { const n = ${store}.length; ${store}.clear(); return { cleared: n }; })()`);
+			return tab.evaluate(`Object.fromEntries(Object.keys(${store}).map((k) => { const v = ${store}.getItem(k); return [k, v.length > 200 ? v.slice(0, 200) + '…' : v]; }))`);
+		},
+		async idb() {
+			const tab = await currentTab();
+			await tab.send('IndexedDB.enable');
+			const origin = new URL(tab.url).origin;
+			const names = await tab.send('IndexedDB.requestDatabaseNames', { securityOrigin: origin });
+			if (names.error) throw new Error(names.error.message);
+			const out = [];
+			for (const name of names.result.databaseNames || []) {
+				const d = await tab.send('IndexedDB.requestDatabase', { securityOrigin: origin, databaseName: name });
+				const db = d.result?.databaseWithObjectStores;
+				out.push({ name, version: db?.version, stores: (db?.objectStores || []).map((o) => ({ name: o.name, keyPath: o.keyPath?.string ?? o.keyPath?.array, indexes: (o.indexes || []).map((i) => i.name) })) });
+			}
+			return { origin, databases: out };
+		},
+
+		// ---- Sources / debugger
+		async scripts({ filter }) {
+			const tab = await currentTab();
+			await ensureDebugger(tab);
+			let list = [...tab.scripts.values()].filter((sc) => sc.url);
+			if (filter) list = list.filter((sc) => sc.url.includes(filter));
+			return list.map((sc) => ({ id: sc.scriptId, url: sc.url, lines: sc.endLine + 1 }));
+		},
+		async source({ match }) {
+			const tab = await currentTab();
+			await ensureDebugger(tab);
+			const sc = tab.scripts.get(match) || [...tab.scripts.values()].reverse().find((x) => x.url && x.url.includes(match));
+			if (!sc) throw new Error(`no script matches "${match}" (see scripts)`);
+			const r = await tab.send('Debugger.getScriptSource', { scriptId: sc.scriptId });
+			if (r.error) throw new Error(r.error.message);
+			return { url: sc.url, source: r.result.scriptSource };
+		},
+		async breakpoint({ action, match, line, condition }) {
+			const tab = await currentTab();
+			await ensureDebugger(tab);
+			tab.breakpoints ||= new Map();
+			if (action === 'clear') {
+				for (const id of tab.breakpoints.keys()) await tab.send('Debugger.removeBreakpoint', { breakpointId: id });
+				tab.breakpoints.clear();
+				return 'all breakpoints removed';
+			}
+			if (action === 'list') return [...tab.breakpoints.entries()].map(([id, b]) => ({ id, ...b }));
+			const r = await tab.send('Debugger.setBreakpointByUrl', { urlRegex: match.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), lineNumber: Number(line) - 1, ...(condition && { condition }) });
+			if (r.error) throw new Error(r.error.message);
+			tab.breakpoints.set(r.result.breakpointId, { match, line: Number(line), condition, resolved: (r.result.locations || []).length });
+			return { id: r.result.breakpointId, resolvedLocations: (r.result.locations || []).length };
+		},
+		async pauseOn({ state }) {
+			const tab = await currentTab();
+			await ensureDebugger(tab);
+			const r = await tab.send('Debugger.setPauseOnExceptions', { state });
+			if (r.error) throw new Error(r.error.message);
+			return { pauseOnExceptions: state };
+		},
+		async paused({ locals }) {
+			const tab = await currentTab();
+			if (!tab.pausedAt) return { paused: false };
+			const p = tab.pausedAt;
+			const frames = p.callFrames.map((f) => {
+				const sc = tab.scripts.get(f.location.scriptId);
+				return { fn: f.functionName || '(anonymous)', at: `${sc?.url ? sc.url.split('/').pop().split('?')[0] : f.location.scriptId}:${f.location.lineNumber + 1}:${(f.location.columnNumber ?? 0) + 1}` };
+			});
+			let scope;
+			if (locals !== false) {
+				const top = p.callFrames[0];
+				const local = (top.scopeChain || []).find((s) => s.type === 'local') || top.scopeChain?.[0];
+				if (local?.object?.objectId) {
+					const props = await tab.send('Runtime.getProperties', { objectId: local.object.objectId, ownProperties: true });
+					scope = Object.fromEntries((props.result?.result || []).slice(0, 40).map((v) => [v.name, v.value ? ('value' in v.value ? v.value.value : v.value.description || v.value.type) : '?']));
+				}
+			}
+			let line;
+			const sc = tab.scripts.get(p.callFrames[0].location.scriptId);
+			if (sc) {
+				const src = await tab.send('Debugger.getScriptSource', { scriptId: sc.scriptId });
+				const lines = (src.result?.scriptSource || '').split('\n');
+				const ln = p.callFrames[0].location.lineNumber, col = p.callFrames[0].location.columnNumber ?? 0;
+				const text = lines[ln] || '';
+				line = text.length > 200 ? text.slice(Math.max(0, col - 80), col + 120) : text;
+			}
+			return { paused: true, reason: p.reason, data: p.data, line, frames, scope };
+		},
+		async step({ how }) {
+			const tab = await currentTab();
+			const method = { over: 'Debugger.stepOver', into: 'Debugger.stepInto', out: 'Debugger.stepOut', resume: 'Debugger.resume', pause: 'Debugger.pause' }[how];
+			if (!method) throw new Error('step over|into|out, resume, pause');
+			const wasPaused = !!tab.pausedAt;
+			const next = new Promise((res) => {
+				const off = tab.on('Debugger.paused', () => { off(); res(true); });
+				setTimeout(() => { off(); res(false); }, how === 'resume' ? 300 : 5000);
+			});
+			const r = await tab.send(method);
+			if (r.error) throw new Error(r.error.message);
+			const pausedAgain = await next;
+			return { [how]: true, wasPaused, paused: pausedAgain || !!tab.pausedAt };
+		},
+		async frameEval({ js }) {
+			const tab = await currentTab();
+			if (!tab.pausedAt) throw new Error('not paused');
+			const r = await tab.send('Debugger.evaluateOnCallFrame', { callFrameId: tab.pausedAt.callFrames[0].callFrameId, expression: js, returnByValue: true });
+			if (r.error) throw new Error(r.error.message);
+			if (r.result.wasThrown || r.result.exceptionDetails) throw new Error(r.result.result?.description || 'threw');
+			return r.result.result?.value ?? r.result.result?.description;
+		},
+
+		// ---- Rendering / emulation
+		async paintflash({ on }) {
+			const tab = await currentTab();
+			const r = await tab.send('Page.setShowPaintRects', { result: on });
+			if (r.error) throw new Error(r.error.message);
+			return { paintFlashing: on };
+		},
+		async ua({ value }) {
+			const tab = await currentTab();
+			const r = await tab.send('Page.overrideUserAgent', value ? { value } : {});
+			if (r.error) throw new Error(r.error.message);
+			return { userAgent: value || 'default', appliesFrom: 'next request / reload' };
+		},
+		async jsEnabled({ on }) {
+			const tab = await currentTab();
+			const r = await tab.send('Page.overrideSetting', on ? { setting: 'ScriptEnabled' } : { setting: 'ScriptEnabled', value: false });
+			if (r.error) throw new Error(r.error.message);
+			return { javascript: on ? 'default' : 'disabled', appliesFrom: 'next reload' };
+		},
+
+		// ---- Network extras
+		async har() {
+			const tab = await currentTab();
+			const entries = [...tab.requests.values()].map((r) => ({
+				startedDateTime: new Date(r.t).toISOString(),
+				time: r.ms ?? 0,
+				request: { method: r.method, url: r.url, httpVersion: 'HTTP/2', headers: Object.entries(r.reqHeaders || {}).map(([name, value]) => ({ name, value: String(value) })), queryString: [...new URL(r.url).searchParams].map(([name, value]) => ({ name, value })), cookies: [], headersSize: -1, bodySize: r.postData ? r.postData.length : 0, ...(r.postData && { postData: { mimeType: (r.reqHeaders || {})['Content-Type'] || '', text: r.postData } }) },
+				response: { status: r.status ?? 0, statusText: r.failed || '', httpVersion: 'HTTP/2', headers: Object.entries(r.headers || {}).map(([name, value]) => ({ name, value: String(value) })), cookies: [], content: { size: r.bytes ?? 0, mimeType: r.mime || '' }, redirectURL: '', headersSize: -1, bodySize: r.bytes ?? -1 },
+				cache: {},
+				timings: { send: 0, wait: r.ms ?? 0, receive: 0 },
+				_resourceType: r.type,
+			}));
+			return { log: { version: '1.2', creator: { name: 'iphone-webkit-inspector', version: '0.2.0' }, pages: [{ startedDateTime: entries[0]?.startedDateTime || new Date().toISOString(), id: 'page_1', title: tab.url, pageTimings: {} }], entries } };
+		},
+		async websockets() {
+			const tab = await currentTab();
+			return tab.events
+				.filter((e) => /^Network\.webSocket/.test(e.method))
+				.map((e) => ({ t: new Date(e.t).toISOString().slice(11, 23), event: e.method.replace('Network.webSocket', ''), url: e.params.url, data: e.params.response?.payloadData?.slice(0, 200), opcode: e.params.response?.opcode }));
+		},
+
 		async perf() {
 			const tab = await currentTab();
 			return tab.evaluateAsync(PERF_JS);
@@ -827,6 +1140,63 @@ async function doctor(skipChrome) {
 	if (failed) process.exitCode = 1;
 }
 
+const REPO = 'GUMBOKIM/iphone-webkit-inspector';
+const PLUGIN_VERSION = (() => {
+	try {
+		return JSON.parse(readFileSync(new URL('../../.claude-plugin/plugin.json', import.meta.url), 'utf8')).version;
+	} catch {
+		return 'unknown';
+	}
+})();
+
+// Collects versions, the device model, doctor output and the daemon log tail into an issue body.
+// Device and Mac names, UDIDs, home paths and visited URLs are redacted.
+async function report({ title, what, submit }) {
+	const line = async (cmd, args) => (await run(cmd, args)).out.trim().split('\n')[0];
+	const devices = (await devicectlJson(['list', 'devices']))?.devices || [];
+	const dev = devices.find((d) => d.connectionProperties?.tunnelState === 'connected') || devices[0];
+	let status = 'daemon not running';
+	if (await daemonUp()) status = JSON.stringify(await call('status').catch((e) => e.message));
+	const doc = (await run(process.execPath, [fileURLToPath(import.meta.url), 'doctor', '--no-chrome'])).out.trim();
+	let log = '';
+	try {
+		log = readFileSync(LOG_FILE, 'utf8').split('\n').slice(-60).join('\n');
+	} catch {}
+	const names = devices.map((d) => d.deviceProperties?.name).filter(Boolean);
+	const redact = (t) => {
+		let out = String(t).replaceAll(homedir(), '~').replace(/\b[0-9A-F]{8}-[0-9A-F]{16}\b/gi, '<udid>').replace(/\b[0-9a-f]{40}\b/gi, '<udid>');
+		for (const n of names) out = out.replaceAll(n, '<device>');
+		const host = hostname().split('.')[0];
+		if (host) out = out.replaceAll(host, '<mac>');
+		// Pages the user visited stay private: keep only the scheme.
+		out = out.replace(/\bhttps?:\/\/[^\s"'<>)]+/g, (u) => (u.startsWith('http://127.0.0.1') ? u : u.split('://')[0] + '://<url>')).replace(/PID%3A\d+%3A\d+|PID:\d+:\d+/g, '<tab>');
+		return out;
+	};
+	const env = [
+		`plugin: ${PLUGIN_VERSION}`,
+		`macOS: ${await line('sw_vers', ['-productVersion'])}`,
+		`Xcode: ${await line('xcodebuild', ['-version'])}`,
+		`node: ${process.version}`,
+		`uv: ${await line('uv', ['--version'])}`,
+		`pymobiledevice3: ${PMD3.split('==')[1]}`,
+		`device: ${dev ? `${dev.hardwareProperties?.marketingName || dev.hardwareProperties?.productType} / iOS ${dev.deviceProperties?.osVersionNumber} / ${dev.connectionProperties?.transportType}` : 'none found'}`,
+		`daemon: ${status}`,
+	].join('\n');
+	const body = redact(`### What happened\n\n${what || '<!-- what you ran and what went wrong -->'}\n\n### Environment\n\n\`\`\`\n${env}\n\`\`\`\n\n### doctor\n\n\`\`\`\n${doc}\n\`\`\`\n\n### Daemon log (last 60 lines)\n\n\`\`\`\n${log || '(empty)'}\n\`\`\`\n`);
+	const file = join(tmpdir(), `iphone-webkit-inspector-report-${Date.now()}.md`);
+	writeFileSync(file, body);
+	const t = title || 'Bug: ';
+	if (submit) {
+		const r = await run('gh', ['issue', 'create', '--repo', REPO, '--title', t, '--body-file', file, '--label', 'bug']);
+		console.log(r.code === 0 ? `filed: ${r.out.trim().split('\n').pop()}` : `gh failed (${r.out.trim()}); body saved to ${file}`);
+		return;
+	}
+	const short = body.length > 6000 ? body.slice(0, 6000) + '\n…(truncated, full report in the file)' : body;
+	console.log(`report saved: ${file}\n`);
+	console.log(`open to file an issue (review it first):\nhttps://github.com/${REPO}/issues/new?labels=bug&title=${encodeURIComponent(t)}&body=${encodeURIComponent(short)}`);
+	console.log(`\nor file it directly: node ${fileURLToPath(import.meta.url)} report --title "..." --what "..." --submit   (uses gh)`);
+}
+
 async function connectedUdid() {
 	if (process.env.IOS_UDID) return process.env.IOS_UDID;
 	const out = join(tmpdir(), `devicectl-${process.pid}.json`);
@@ -842,43 +1212,74 @@ const trunc = (s, n) => (s && s.length > n ? s.slice(0, n - 1) + '…' : s ?? ''
 
 const HELP = `ios.mjs — inspect and drive Safari/Chrome on an iPhone (USB or Wi-Fi)
 
+Element targets (<el>): CSS selector | text=<label> | @e12 (from snapshot) | x y
+
  setup
   start | stop | status        background bridge (auto-starts on first command)
   doctor                       check Xcode, the iPhone, and the Safari/Chrome inspector settings
   launch [safari|chrome|<bundle-id>] [url] [--restart]   open an app (new tab when a url is given)
+  report [--title t] [--what text] [--submit]   collect diagnostics for a GitHub issue
 
  tabs and pages
   tabs                         list tabs (visible = on the iPhone screen)
   use <id|url-part>            pick the tab to work on (default: the visible one)
   open <url> | reload | close  navigate (waits for load, clears logs/net) | reload | close tab
+  snapshot [--all]             elements you can act on, as @eN refs
   eval <js> [--gesture]        run JS; expression, or statements with return/await
-  tap <selector> | tap text=<label> | tap <x> <y>   touch + click, run as a user gesture
-  type <selector> <text>       set an input's value and fire input/change
+  tap <el>                     touch + click, run as a user gesture
+  type <el> <text>             set an input's value and fire input/change
   shot [path]                  screenshot (PNG, device resolution)
   record start [dir] | record stop      screen recording as JPEG frames named <n>-<ms>ms.jpg
+
+ elements
+  dom <el>                     outerHTML, box, margin/padding, display
+  styles <el> [--computed [p1,p2]]      matched CSS rules with file:line, inline style, computed values
+  a11y <el>                    accessibility role, label, states
+  highlight <el> | highlight --off      draw the box model on the phone screen
+  pseudo <el> hover,active,focus|off    force pseudo-classes
+  listeners <el>               event listeners on the element and its ancestors
+  layers                       composited layers: memory, paint count, why they exist
 
  console and network
   logs [--errors] [--clear]    console messages, exceptions, Safari warnings
   net [url-part] [--failed]    requests: id status type size time url
   req <id|url-part>            request + response headers, post data
   body <id|url-part> [--out f] response body
+  har [out.har]                export recorded requests as HAR
+  ws                           WebSocket frames
   block <url-part>             fail matching requests
   mock <url-part> <status> <body|@file> [--type ct]   answer matching requests yourself
   mocks | unmock [url-part]    list | remove interception rules (all when no url-part)
   nocache [on|off]             disable the HTTP cache
   events [method-prefix] [--last n] [--clear]   raw CDP events received from the tab
 
+ sources and debugger
+  scripts [url-part]           loaded scripts
+  source <id|url-part> [--line n] [--out f]   script source (or 11 lines around n)
+  break <url-part> <line> [--if expr] | break list | break clear
+  pause-on all|uncaught|none   pause on exceptions
+  pause | resume | step [over|into|out]
+  paused                       where it stopped: reason, line, stack, locals
+  frame-eval <js>              evaluate in the paused frame
+
+ application
+  cookies [--clear [name]]     cookies for the page
+  storage [local|session] [--clear]
+  idb                          IndexedDB databases and object stores
+
  performance
   perf [url-part] [--slow] [--json]     Performance API: TTFB, DCL, load, FCP, CLS, resource waterfall
-  trace start [--screenshots] | trace stop [out.json]   full Chrome-format performance trace + summary
+  trace start [--screenshots] | trace stop [out.json]   Chrome-format performance trace + summary
   profile start | profile stop [out.cpuprofile]         JS CPU profile + hottest functions
   usage start | usage stop [out.json]   CPU (per thread) and memory by category every ~0.5s
   heap [out.heapsnapshot]      JS heap snapshot
 
- page environment
+ rendering and environment
   media dark|light|print|screen|reset   emulate prefers-color-scheme / media type
+  paintflash on|off            flash repainted areas on the phone
+  ua <string>|reset            override the User-Agent (from the next request)
+  js on|off                    disable page JavaScript (from the next reload)
   inject <js|@file> | inject --clear   run a script in every new document before page scripts
-  listeners <selector>         event listeners attached to an element
 
   cdp <Method> [json-params]   any other CDP method (unknown ones are forwarded to WebKit's protocol)
 `;
@@ -889,7 +1290,7 @@ async function main() {
 	if (!cmd || cmd === 'help' || cmd === '-h') return console.log(HELP);
 
 	const flags = new Set(rest.filter((a) => a.startsWith('--')));
-	const valueFlags = new Set(['--out', '--type', '--last']);
+	const valueFlags = new Set(['--out', '--type', '--last', '--computed', '--line', '--if', '--title', '--what']);
 	const pos = rest.filter((a, i) => !a.startsWith('--') && !valueFlags.has(rest[i - 1]));
 	const flagVal = (name) => {
 		const i = rest.indexOf(name);
@@ -897,6 +1298,7 @@ async function main() {
 	};
 
 	if (cmd === 'doctor') return doctor(flags.has('--no-chrome'));
+	if (cmd === 'report') return report({ title: flagVal('--title'), what: flagVal('--what'), submit: flags.has('--submit') });
 
 	if (cmd === 'launch') {
 		// Opens an app on the phone via Xcode's devicectl. --restart is needed after toggling Chrome's Web Inspector.
@@ -975,6 +1377,111 @@ async function main() {
 			const path = resolve(pos[0] || join(tmpdir(), `iphone-${Date.now()}.png`));
 			return console.log((await call('shot', { path })).path);
 		}
+		case 'snapshot': {
+			const r = await call('snapshot', { all: flags.has('--all') });
+			console.log(`${r.title} — ${r.url}\nviewport ${r.viewport.join('×')}, scrollY ${r.scrollY}${flags.has('--all') ? '' : ' (visible part only; --all for the whole page)'}`);
+			for (const it of r.items) console.log(`@${it.ref.padEnd(4)} ${it.role.padEnd(12)} ${JSON.stringify(it.name)}${it.state ? ' [' + it.state + ']' : ''}  ${it.box.join(',')}`);
+			console.log(`(${r.items.length} elements; use @eN with tap/type/dom/styles/highlight)`);
+			return;
+		}
+		case 'dom':
+			return console.log(await call('dom', { target: targetJs(pos.join(' ')) }));
+		case 'styles': {
+			const comp = flagVal('--computed') ?? (flags.has('--computed') ? true : undefined);
+			const r = await call('styles', { target: targetJs(pos.join(' ')), computed: comp });
+			if (r.inline.length) console.log(`element.style {\n  ${r.inline.join(';\n  ')}\n}`);
+			for (const rule of r.rules) {
+				if (!rule.props.length) continue;
+				console.log(`${rule.media ? '@media ' + rule.media + ' ' : ''}${rule.selector} {   /* ${rule.source} */\n  ${rule.props.join(';\n  ')}\n}`);
+			}
+			if (r.computed) console.log('computed:', r.computed);
+			return;
+		}
+		case 'a11y':
+			return console.log(await call('a11y', { target: targetJs(pos.join(' ')) }));
+		case 'highlight':
+			return console.log(await call('highlight', flags.has('--off') ? { off: true } : { target: targetJs(pos.join(' ')) }));
+		case 'pseudo': {
+			// pseudo <selector> hover,active,focus | pseudo <selector> off
+			const classes = pos[pos.length - 1];
+			return console.log(await call('pseudo', { target: targetJs(pos.slice(0, -1).join(' ')), classes }));
+		}
+		case 'layers': {
+			const list = await call('layers');
+			for (const l of list) console.log(`${String(l.memoryKB).padStart(7)}KB ${l.size.padStart(11)}  paints ${String(l.paints ?? '-').padStart(4)}  ${(l.node || '').padEnd(28)} ${l.reasons.join(', ')}`);
+			console.log(`(${list.length} layers, ${list.reduce((a, l) => a + l.memoryKB, 0)}KB)`);
+			return;
+		}
+		case 'cookies':
+			return console.log(await call('cookies', flags.has('--clear') ? { clear: pos[0] || true } : {}));
+		case 'storage':
+			return console.log(await call('storage', { kind: pos[0] || 'local', clear: flags.has('--clear') }));
+		case 'idb':
+			return console.log(JSON.stringify(await call('idb'), null, 2));
+		case 'scripts': {
+			const list = await call('scripts', { filter: pos[0] });
+			for (const sc of list) console.log(`${String(sc.id).padEnd(6)} ${String(sc.lines).padStart(6)} lines  ${trunc(sc.url, 130)}`);
+			console.log(`(${list.length} scripts)`);
+			return;
+		}
+		case 'source': {
+			const r = await call('source', { match: pos[0] });
+			const out = flagVal('--out');
+			if (out) {
+				writeFileSync(out, r.source);
+				return console.log(`${r.url} -> ${out} (${r.source.length} chars)`);
+			}
+			const lineArg = flagVal('--line');
+			if (lineArg) {
+				const n = Number(lineArg), lines = r.source.split('\n');
+				for (let i = Math.max(1, n - 5); i <= Math.min(lines.length, n + 5); i++) console.log(`${i === n ? '>' : ' '}${String(i).padStart(6)}  ${trunc(lines[i - 1], 200)}`);
+				return;
+			}
+			console.error(`# ${r.url}`);
+			return console.log(r.source);
+		}
+		case 'break': {
+			if (pos[0] === 'list' || pos[0] === 'clear') return console.log(await call('breakpoint', { action: pos[0] }));
+			return console.log(await call('breakpoint', { action: 'set', match: pos[0], line: pos[1], condition: flagVal('--if') }));
+		}
+		case 'pause-on':
+			return console.log(await call('pauseOn', { state: pos[0] === 'all' ? 'all' : pos[0] === 'uncaught' ? 'uncaught' : pos[0] === 'none' || pos[0] === 'off' ? 'none' : 'all' }));
+		case 'paused': {
+			const r = await call('paused', {});
+			if (!r.paused) return console.log('not paused');
+			console.log(`paused (${r.reason})${r.data?.description ? ': ' + trunc(r.data.description, 160) : ''}`);
+			if (r.line) console.log(`  > ${trunc(r.line.trim(), 200)}`);
+			console.log('stack:');
+			for (const f of r.frames.slice(0, 12)) console.log(`  ${f.fn}  ${f.at}`);
+			if (r.scope) console.log('locals:', r.scope);
+			return;
+		}
+		case 'step':
+			return console.log(await call('step', { how: pos[0] || 'over' }));
+		case 'resume':
+			return console.log(await call('step', { how: 'resume' }));
+		case 'pause':
+			return console.log(await call('step', { how: 'pause' }));
+		case 'frame-eval':
+			return console.log(await call('frameEval', { js: pos.join(' ') }));
+		case 'paintflash':
+			return console.log(await call('paintflash', { on: pos[0] !== 'off' }));
+		case 'ua':
+			return console.log(await call('ua', { value: pos[0] === 'reset' ? undefined : pos.join(' ') || undefined }));
+		case 'js':
+			return console.log(await call('jsEnabled', { on: pos[0] !== 'off' }));
+		case 'har': {
+			const path = resolve(pos[0] || join(tmpdir(), `iphone-${Date.now()}.har`));
+			const h = await call('har');
+			writeFileSync(path, JSON.stringify(h, null, 1));
+			return console.log(`${h.log.entries.length} entries -> ${path}  (open in Chrome DevTools Network → Import HAR)`);
+		}
+		case 'ws': {
+			const list = await call('websockets');
+			for (const w of list) console.log(`${w.t} ${w.event.padEnd(14)} ${w.url ? trunc(w.url, 80) : ''}${w.data ? ' ' + JSON.stringify(w.data) : ''}`);
+			if (!list.length) console.log('(no WebSocket traffic recorded)');
+			return;
+		}
 		case 'perf': {
 			const p = await call('perf');
 			if (flags.has('--json')) return console.log(JSON.stringify(p, null, 2));
@@ -1000,13 +1507,7 @@ async function main() {
 		}
 		case 'tap': {
 			// Synthetic touch → pointer → mouse → click sequence at the element's center (or at x,y).
-			const sel = pos.join(' ');
-			const target =
-				pos.length === 2 && pos.every((v) => /^\d+$/.test(v))
-					? `document.elementFromPoint(${pos[0]}, ${pos[1]})`
-					: sel.startsWith('text=')
-						? `[...document.querySelectorAll('button, a, [role=button], label, summary, input[type=button], input[type=submit], [onclick]')].find((e) => e.offsetParent !== null && (e.innerText || e.value || '').trim() === ${JSON.stringify(sel.slice(5))}) || [...document.querySelectorAll('button, a, [role=button], label, summary')].find((e) => e.offsetParent !== null && (e.innerText || '').includes(${JSON.stringify(sel.slice(5))}))`
-						: `document.querySelector(${JSON.stringify(sel)})`;
+			const target = targetJs(pos.join(' '));
 			const js = `
 				const el = ${target};
 				if (!el) throw new Error('no element for ${pos.join(' ').replace(/'/g, '')}');
@@ -1037,7 +1538,7 @@ async function main() {
 			// Sets the value on the focused or given input and fires input/change so frameworks notice.
 			const [sel, ...words] = pos;
 			const js = `
-				const el = document.querySelector(${JSON.stringify(sel)});
+				const el = ${targetJs(sel)};
 				if (!el) throw new Error('no element ${sel.replace(/'/g, '')}');
 				el.focus();
 				const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
