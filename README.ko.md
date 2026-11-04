@@ -4,12 +4,12 @@
 
 Claude가 **실제 아이폰의 Safari나 Chrome**을 개발자 도구 수준으로 들여다보고 조작하게 해 주는 Claude Code 플러그인입니다. USB와 Wi-Fi 둘 다 됩니다.
 
-Playwright나 Chrome 개발자 도구로는 실제 아이폰의 Safari를 조종할 수 없어서, 이 플러그인은 Safari의 Web Inspector를 거쳐 들어갑니다. 작은 데몬이 [pymobiledevice3](https://github.com/doronz88/pymobiledevice3)의 CDP 브리지를 띄우고, 탭마다 연결을 붙잡아 둔 채 콘솔, 네트워크, 디버거 이벤트를 모아 둡니다. Claude는 CLI 하나로 이 데몬과 주고받습니다.
+Chrome 개발자 도구로는 실제 아이폰의 Safari에 닿을 수 없고, Playwright는 붙기는 해도 절반쯤만 됩니다(아래 참고). 그래서 이 플러그인은 Safari의 Web Inspector를 거쳐 들어갑니다. 작은 데몬이 [pymobiledevice3](https://github.com/doronz88/pymobiledevice3)의 CDP 브릿지를 띄우고, 탭마다 연결을 붙잡아 둔 채 콘솔, 네트워크, 디버거 이벤트를 모아 둡니다. Claude는 CLI 하나로 이 데몬과 주고받습니다.
 
 ## 비교
 
 - **Chrome 개발자 도구**: 데스크톱 Chrome
-- **Playwright**: macOS용 WebKit 빌드. Safari에 가장 가깝지만 실제 아이폰에는 붙지 못합니다.
+- **Playwright**: macOS용 WebKit 빌드 기준. 실제 아이폰에는 같은 브릿지를 거쳐 일부만 됩니다(아래 참고).
 - **이 플러그인**: 아이폰에서 실행 중인 Safari 또는 Chrome
 
 ✅ 지원 · ⚠️ 일부 지원 · ❌ 미지원
@@ -17,7 +17,7 @@ Playwright나 Chrome 개발자 도구로는 실제 아이폰의 Safari를 조종
 | 기능 | Chrome 개발자 도구 | Playwright | 이 플러그인 |
 |---|:-:|:-:|:-:|
 | **대상** | | | |
-| 실기기의 iOS Safari / Chrome | ❌ | ❌ (macOS의 WebKit) | ✅ USB 또는 Wi-Fi |
+| 실기기의 iOS Safari / Chrome | ❌ | ⚠️ 같은 브릿지로 일부만 (아래) | ✅ USB 또는 Wi-Fi |
 | 여러 탭 | ✅ | ✅ | ⚠️ 어느 탭이든 검사 가능, 화면에 띄우는 탭은 못 바꿈 |
 | **페이지와 입력** | | | |
 | 이동, 새로고침, 탭 열기·닫기 | ✅ | ✅ | ✅ |
@@ -78,6 +78,10 @@ Playwright나 Chrome 개발자 도구로는 실제 아이폰의 Safari를 조종
 
 정리하면, 개발자 도구를 열어서 보통 하는 일은 실제 아이폰에서도 거의 다 됩니다. 안 되는 것은 OS 수준 입력(브라우저 UI, 키보드), 속도 제한, Lighthouse, LCP, CLS입니다.
 
+### 같은 브릿지에 Playwright를 붙이면
+
+브릿지가 CDP를 받으므로 Safari를 앞에 띄워 두면 Playwright도 `chromium.connectOverCDP`로 실제 아이폰에 붙습니다. iOS 18.6.2와 pymobiledevice3 11.49.2에서 시험해 보니 같은 사이트 안의 이동, aria 스냅샷, 입력, 콘솔, 스크린샷, `evaluate`는 됩니다. 클릭은 페이지 안에서 만든 `click` 이벤트(`isTrusted: false`)로만 들어가서 링크를 눌러도 안 넘어갈 수 있고, `page.tap()`은 `hasTouch`가 필요하다며 실패합니다. `mouse.wheel`, `waitForResponse`, `route`, `setViewportSize`, `cookies()`, `newPage()`, `alert()` 처리는 실패하거나 멈추고, 다른 사이트로 이동하면 연결이 끊깁니다. Playwright MCP(`--cdp-endpoint`)는 Safari에 뒤쪽 탭이 있으면 첫 명령부터 멈추고, 탭이 하나여도 이동, 스냅샷, 스크린샷이 시간 초과로 끝납니다. 이 플러그인은 브릿지의 WebKit 명령을 직접 써서 `tap`으로 링크가 넘어가고, 응답 본문, 모킹, 쿠키, 새 탭도 됩니다. `alert()`은 둘 다 닫지 못해서 사람이 아이폰에서 닫기를 눌러야 합니다.
+
 ## 명령
 
 요소 지정(`<el>`): CSS 선택자, `text=<글자>`, `snapshot`에서 받은 `@e12`, 또는 `x y` 좌표
@@ -126,10 +130,10 @@ iPhone 15 Pro, iOS 18.6.2, Xcode 27.2, pymobiledevice3 11.49.2에서 시험했�
 ## 무엇을 실행하고 어디에 연결하나
 
 - `node skills/iphone-webkit-inspector/ios.mjs`: Claude가 부르는 CLI입니다. 소스를 그대로 읽어 볼 수 있고 npm 의존성도 없습니다. 첫 명령을 실행할 때 같은 스크립트가 백그라운드 데몬으로 뜨는데, 이 데몬은 네트워크 포트를 열지 않고 Unix 소켓(`~/.cache/iphone-webkit-inspector/daemon.sock`)으로만 연결을 받습니다.
-- `uvx --from pymobiledevice3==11.49.2 python bridge_guard.py <소켓> webinspector cdp`: Web Inspector 브리지입니다. 처음 실행하면 `uv`가 PyPI에서 이 버전의 pymobiledevice3를 내려받고, Python 3.12가 없으면 uv가 관리하는 Python 3.12도 받습니다.
-- `bridge_guard.py`는 pymobiledevice3가 원래 여는 TCP 포트 대신 `~/.cache/iphone-webkit-inspector/bridge.sock` 소켓으로 브리지를 띄우고, `Origin` 헤더가 붙은 요청(웹페이지가 보낸 요청)은 막습니다. 두 소켓 모두 본인만 열 수 있는 폴더(권한 700) 안에 있어서 같은 Mac의 다른 사용자는 닿을 수 없고, 웹페이지는 Unix 소켓에 아예 접근하지 못합니다. 토큰이나 비밀값은 쓰지 않습니다.
+- `uvx --from pymobiledevice3==11.49.2 python bridge_guard.py <소켓> webinspector cdp`: Web Inspector 브릿지입니다. 처음 실행하면 `uv`가 PyPI에서 이 버전의 pymobiledevice3를 내려받고, Python 3.12가 없으면 uv가 관리하는 Python 3.12도 받습니다.
+- `bridge_guard.py`는 pymobiledevice3가 원래 여는 TCP 포트 대신 `~/.cache/iphone-webkit-inspector/bridge.sock` 소켓으로 브릿지를 띄우고, `Origin` 헤더가 붙은 요청(웹페이지가 보낸 요청)은 막습니다. 두 소켓 모두 본인만 열 수 있는 폴더(권한 700) 안에 있어서 같은 Mac의 다른 사용자는 닿을 수 없고, 웹페이지는 Unix 소켓에 아예 접근하지 못합니다. 토큰이나 비밀값은 쓰지 않습니다.
 - `xcrun devicectl`: 아이폰을 찾고 Safari나 Chrome을 실행합니다.
-- 브리지가 아이폰에 붙는 길은 USB면 macOS의 `usbmuxd`, Wi-Fi면 macOS가 Xcode용으로 열어 두는 CoreDevice 터널(`--native`)입니다. 어느 쪽이든 Mac과 아이폰 사이에서만 오갑니다.
+- 브릿지가 아이폰에 붙는 길은 USB면 macOS의 `usbmuxd`, Wi-Fi면 macOS가 Xcode용으로 열어 두는 CoreDevice 터널(`--native`)입니다. 어느 쪽이든 Mac과 아이폰 사이에서만 오갑니다.
 - 아이폰에서 여는 페이지는 평소처럼 인터넷에서 불러오지만, 플러그인 자체가 바깥으로 보내는 것은 없습니다. `report`도 링크만 출력하고, 이슈를 올릴지는 사용자가 정합니다.
 - 디스크에 쓰는 파일: `~/.cache/iphone-webkit-inspector/`(데몬 pid, 소켓 2개, 로그), 그리고 요청한 스크린샷, 트레이스, 프로파일, 힙 스냅샷, HAR, 녹화 파일(기본 위치는 시스템 임시 폴더)
 - `eval`, `tap`, `type`, `mock`, `block`, `inject`, `ua`, `js`, 디버거는 개발자 도구에서처럼 아이폰의 페이지를 실제로 바꿉니다. 그래서 Claude는 이 명령들을 사용자가 지정한 탭에서만 써야 합니다.
@@ -140,7 +144,7 @@ iPhone 15 Pro, iOS 18.6.2, Xcode 27.2, pymobiledevice3 11.49.2에서 시험했�
 
 데몬은 어느 탭이 화면에 떠 있는지 알기 위해 열린 탭에 모두 연결하지만, 콘솔과 네트워크 기록은 작업 중인 탭에서만 켭니다. 그 탭이 닫히면 다른 탭으로 넘어가지 않고 오류를 내며 멈춥니다. 다만 메일이나 은행 같은 개인 탭도 열려 있는 동안은 인스펙터로 접근할 수 있는 상태이니, 신경 쓰이면 닫아 두세요.
 
-`~/.cache/iphone-webkit-inspector/`의 데몬 상태(본인만 읽을 수 있고, 로그에는 전체 URL 대신 사이트 주소(origin)만 남습니다)와 요청한 파일 말고는 아무것도 저장하지 않습니다. 데몬은 최근 콘솔·네트워크 이벤트를 메모리에만 들고 있다가, 멈추면(`ios.mjs stop`, 또는 브리지 종료) 버립니다.
+`~/.cache/iphone-webkit-inspector/`의 데몬 상태(본인만 읽을 수 있고, 로그에는 전체 URL 대신 사이트 주소(origin)만 남습니다)와 요청한 파일 말고는 아무것도 저장하지 않습니다. 데몬은 최근 콘솔·네트워크 이벤트를 메모리에만 들고 있다가, 멈추면(`ios.mjs stop`, 또는 브릿지 종료) 버립니다.
 
 ## 한계
 

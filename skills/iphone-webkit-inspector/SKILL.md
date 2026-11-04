@@ -7,8 +7,8 @@ allowed-tools: Bash(node ${CLAUDE_SKILL_DIR}/ios.mjs *)
 
 # iPhone WebKit Inspector
 
-Playwright and Chrome DevTools can't attach to Safari on a real iPhone. This skill goes through Safari's Web
-Inspector instead: `ios.mjs` runs a background daemon that starts the `pymobiledevice3` CDP bridge (via `uvx`),
+Chrome DevTools can't reach Safari on a real iPhone, and Playwright over the same bridge breaks on clicks, network
+interception and dialogs (Playwright MCP stalls). This skill goes through Safari's Web Inspector instead: `ios.mjs` runs a background daemon that starts the `pymobiledevice3` CDP bridge (via `uvx`),
 keeps one connection per tab, and buffers console, network and debugger events.
 
 ## Running commands

@@ -4,21 +4,22 @@
 
 A Claude Code plugin that lets Claude use Safari or Chrome on a real iPhone the way you'd use DevTools, over USB or Wi-Fi.
 
-Playwright and Chrome DevTools can't drive Safari on a physical iPhone, so this goes through Safari's Web Inspector.
+Chrome DevTools can't reach Safari on a physical iPhone, and Playwright only half works there (see below), so this
+goes through Safari's Web Inspector.
 A small daemon runs the [pymobiledevice3](https://github.com/doronz88/pymobiledevice3) CDP bridge, holds a connection
 to each tab, and buffers console, network and debugger events. Claude talks to it through one CLI.
 
 ## How it compares
 
-Chrome DevTools works on Chrome on your desktop. Playwright's closest thing to Safari is its WebKit build on macOS,
-and it can't attach to a real iPhone. This plugin works on Safari or Chrome running on your iPhone.
+Chrome DevTools works on Chrome on your desktop. Playwright's closest thing to Safari is its WebKit build on macOS;
+the table compares against that. This plugin works on Safari or Chrome running on your iPhone.
 
 ✅ supported · ⚠️ partial · ❌ not supported
 
 | Feature | Chrome DevTools | Playwright | This plugin |
 |---|:-:|:-:|:-:|
 | **Target** | | | |
-| Real iOS Safari / Chrome on a device | ❌ | ❌ (WebKit on macOS) | ✅ USB or Wi-Fi |
+| Real iOS Safari / Chrome on a device | ❌ | ⚠️ through the same bridge, partly (below) | ✅ USB or Wi-Fi |
 | Several tabs | ✅ | ✅ | ⚠️ inspect any tab, can't bring one on screen |
 | **Pages and input** | | | |
 | Navigate, reload, open and close tabs | ✅ | ✅ | ✅ |
@@ -79,6 +80,17 @@ and it can't attach to a real iPhone. This plugin works on Safari or Chrome runn
 
 In short, most of what you'd open DevTools for works on the real phone. You don't get OS-level input (native UI,
 the keyboard), throttling, Lighthouse, LCP or CLS.
+
+### Playwright on the same bridge
+
+The bridge speaks CDP, so Playwright can attach to a real iPhone with `chromium.connectOverCDP` while Safari is in
+front. Tested on iOS 18.6.2 with pymobiledevice3 11.49.2: same-site navigation, the aria snapshot, typing, console,
+screenshots and `evaluate` work. Clicks arrive as synthetic `click` events (`isTrusted: false`), so a link click may
+not navigate; `page.tap()` needs `hasTouch`; `mouse.wheel`, `waitForResponse`, `route`, `setViewportSize`,
+`cookies()`, `newPage()` and `alert()` handling fail or hang; navigating to another site drops the connection.
+Playwright MCP (`--cdp-endpoint`) stalls if Safari has a background tab, and even with one tab its navigate, snapshot
+and screenshot time out. This plugin uses the bridge's WebKit commands directly instead, so `tap` follows links and
+responses, mocks, cookies and new tabs work. Neither can dismiss an `alert()`; someone has to tap Close on the phone.
 
 ## Commands
 
